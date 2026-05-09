@@ -60,6 +60,74 @@ python3 harness/scripts/advance_stage.py --workspace harness/work
 
 每个阶段都按这个顺序循环：打包 -> agent 工作 -> 验证 -> 推进。
 
+## 任务包是怎么生成的
+
+`package_stage.py` 不是为每个阶段写死一份任务文件。它会读取：
+
+```text
+harness/work/pipeline_state.json
+harness/configs/pipeline.default.json
+```
+
+然后用“通用模板 + 当前阶段配置 + 当前工作区状态”生成当前阶段的任务包。
+
+阶段配置里最重要的字段包括：
+
+```text
+id                 阶段编号
+agent_role         这个阶段的 agent 角色
+objective          这个阶段只做什么
+input_refs         这个阶段允许读取哪些输入
+allowed_edits      这个阶段允许修改哪些路径
+required_outputs   这个阶段必须产出哪些文件
+validation_commands 额外的机器校验命令
+```
+
+生成的任务包固定包含：
+
+```text
+AGENT_TASK.md        给 agent 看的任务说明
+INPUT_MANIFEST.json  本阶段输入文件清单
+OUTPUT_CONTRACT.json 本阶段必须产出的文件清单
+VALIDATION.md        本阶段验收方式
+```
+
+因此，真正控制每个阶段行为的是 `harness/configs/pipeline.default.json`，
+不是一堆手写的独立 prompt。
+
+## 验证失败怎么处理
+
+执行验证：
+
+```bash
+python3 harness/scripts/validate_stage.py --workspace harness/work --stage <stage_id>
+```
+
+验证程序会检查两类内容：
+
+1. `required_outputs` 声明的文件或目录是否存在。
+2. `validation_commands` 声明的命令是否成功返回。
+
+如果失败，终端会打印缺少的文件或失败的命令，同时写出详细报告：
+
+```text
+harness/work/stages/<stage_id>/validation/VALIDATION_REPORT.json
+```
+
+失败后不要执行 `advance_stage.py`。正确处理方式是：
+
+1. 打开 `VALIDATION_REPORT.json`，确认缺少什么或哪个命令失败。
+2. 把失败报告交给当前阶段 agent，让它只修当前阶段允许修改的文件。
+3. 修完后再次执行 `validate_stage.py`。
+4. 只有验证通过后，才执行：
+
+```bash
+python3 harness/scripts/advance_stage.py --workspace harness/work
+```
+
+如果当前 agent 修不好，可以重新运行 `package_stage.py` 生成任务包，
+把任务包和验证失败报告一起交给另一个 agent。不要让下一个阶段在失败状态下继续。
+
 ## DSL 子图并行实现
 
 `05_dsl_partitions` 阶段由主 agent 负责协调多个 subagent。主 agent 先生成每个
