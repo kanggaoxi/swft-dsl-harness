@@ -66,7 +66,7 @@ def extract_partitions(plan: Any) -> list[dict[str, Any]]:
     return normalized
 
 
-def render_agent_task(partition: dict[str, Any], paths: dict[str, str], accuracy: dict[str, Any]) -> str:
+def render_agent_task(partition: dict[str, Any], paths: dict[str, str], precision: dict[str, Any]) -> str:
     partition_id = partition["id"]
     return "\n".join([
         f"# Subagent Task: Implement DSL for `{partition_id}`",
@@ -91,9 +91,11 @@ def render_agent_task(partition: dict[str, Any], paths: dict[str, str], accuracy
         "",
         "## Accuracy Target",
         "",
-        f"- reference: `{accuracy.get('reference', 'PyTorch fp32')}`",
-        f"- target: `{accuracy.get('target', 'SWFT fp16')}`",
-        f"- relative error: `{accuracy.get('rtol', 'unspecified')}`",
+        f"- model entry inputs and weights: `{precision.get('model_input_dtype', 'unspecified')}`",
+        f"- torch reference and golden outputs: `{precision.get('torch_reference_dtype', 'unspecified')}`",
+        f"- SWFT DSL runtime: `{precision.get('dsl_runtime_dtype', 'unspecified')}`",
+        f"- comparison metric: `{precision.get('comparison_metric', 'unspecified')}`",
+        f"- required tolerance: `{precision.get('comparison_rtol', 'unspecified')}`",
         "",
         "## Allowed Output Area",
         "",
@@ -177,6 +179,7 @@ def main() -> int:
             "partition_id": partition_id,
             "created_at": now_iso(),
             "workspace": str(workspace),
+            "precision": config.get("precision", {}),
             "paths": paths,
             "shared_inputs": shared_inputs,
         }
@@ -192,7 +195,7 @@ def main() -> int:
         save_json(base / "INPUT_MANIFEST.json", input_manifest)
         save_json(base / "OUTPUT_CONTRACT.json", output_contract)
         (base / "AGENT_TASK.md").write_text(
-            render_agent_task(partition, paths, config.get("accuracy", {})),
+            render_agent_task(partition, paths, config.get("precision", {})),
             encoding="utf-8",
         )
         created.append({

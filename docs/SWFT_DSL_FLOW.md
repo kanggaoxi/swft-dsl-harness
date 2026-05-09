@@ -4,10 +4,18 @@ Use this document as the minimum context for agents implementing SWFT DSL.
 
 The harness uses route B: PyTorch is the trusted semantic source. Earlier
 stages export and validate `model_ir.json`, `node_manifest.json`,
-`weight_map.json`, and `torch_runner.py`; golden bins are captured directly
-from PyTorch. DSL agents should consume those validated artifacts and should
-not re-derive model semantics from the full PyTorch source unless a validation
-report explicitly asks for that.
+`weight_map.json`, `input_spec.json`, and `torch_runner.py`; golden bins are
+captured directly from PyTorch. DSL agents should consume those validated
+artifacts and should not re-derive model semantics from the full PyTorch
+source unless a validation report explicitly asks for that.
+
+Precision contract:
+
+- model weights and model entry inputs are fp32
+- torch reference outputs and golden bins are fp32
+- SWFT DSL implementation runs in fp16
+- final comparison against torch fp32 outputs must satisfy relative error
+  `<= 4e-5`
 
 ## Repository Areas
 

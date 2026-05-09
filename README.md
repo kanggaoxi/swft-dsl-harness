@@ -4,6 +4,7 @@
 它走路线 B：以可信的 PyTorch 模型为唯一语义源，先由脚本/agent 导出并验证
 机器可读 IR，再基于 IR 切分子图，并直接用 PyTorch 捕获每个子图的 golden。
 这样后续 agent 不需要反复阅读完整 PyTorch 源码，也不依赖手写的文字版计算图。
+输入说明也不是手工预先准备的，`input_spec.json` 会由第 1 阶段根据模型代码和权重导出。
 
 ## 流水线
 
@@ -32,9 +33,11 @@ python3 harness/scripts/init_pipeline.py --workspace harness/work
 ```text
 harness/work/shared/model/model.py
 harness/work/shared/model/weights.pth
-harness/work/shared/model/input_spec.json
 harness/work/shared/similar_dsl/similar_model_dsl.py
 ```
+
+这里你只需要准备模型代码和权重。`input_spec.json` 会在 `01_torch_export`
+阶段生成，里面会记录模型入口输入的名字、shape、dtype 和构造方式。
 
 为当前阶段生成任务包：
 

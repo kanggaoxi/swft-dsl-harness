@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def render_task(stage: dict, input_manifest: dict, output_contract: dict, validation_text: str) -> str:
+def render_task(stage: dict, input_manifest: dict, output_contract: dict, validation_text: str, precision: dict | None = None) -> str:
     lines = [
         f"# Agent Task: {stage['id']} - {stage['name']}",
         "",
@@ -46,11 +46,26 @@ def render_task(stage: dict, input_manifest: dict, output_contract: dict, valida
         "",
         stage["objective"],
         "",
+        "## Precision Contract",
+        "",
+    ]
+    if precision:
+        lines.extend([
+            f"- model entry inputs and weights: `{precision.get('model_input_dtype', 'unspecified')}`",
+            f"- torch reference and golden outputs: `{precision.get('torch_reference_dtype', 'unspecified')}`",
+            f"- SWFT DSL runtime: `{precision.get('dsl_runtime_dtype', 'unspecified')}`",
+            f"- comparison metric: `{precision.get('comparison_metric', 'unspecified')}`",
+            f"- required tolerance: `{precision.get('comparison_rtol', 'unspecified')}`",
+            "",
+        ])
+    else:
+        lines.extend(["No precision contract is configured for this pipeline.", ""])
+    lines.extend([
         "## Inputs",
         "",
         "Read `INPUT_MANIFEST.json` first. It lists the exact files available to this stage.",
         "",
-    ]
+    ])
     missing = [item for item in input_manifest["inputs"] if not item["exists"]]
     if missing:
         lines.extend([
@@ -140,6 +155,7 @@ def main() -> int:
         "stage": stage_id,
         "created_at": now_iso(),
         "workspace": str(workspace),
+        "precision": config.get("precision", {}),
         "inputs": inputs,
     }
     output_contract = {
@@ -153,7 +169,7 @@ def main() -> int:
     save_json(package / "OUTPUT_CONTRACT.json", output_contract)
     (package / "VALIDATION.md").write_text(validation_text, encoding="utf-8")
     (package / "AGENT_TASK.md").write_text(
-        render_task(stage, input_manifest, output_contract, validation_text),
+        render_task(stage, input_manifest, output_contract, validation_text, config.get("precision", {})),
         encoding="utf-8",
     )
 
