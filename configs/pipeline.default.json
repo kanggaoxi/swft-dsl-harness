@@ -137,6 +137,13 @@
       "name": "SWFT DSL partition implementations",
       "agent_role": "DSL main implementation agent",
       "objective": "The main agent coordinates multiple subagents. Each subagent implements one or more disjoint partitions using the partition plan and torch-generated golden bins. The main agent integrates accepted partition implementations.",
+      "subagent_packages": {
+        "enabled": true,
+        "script": "harness/scripts/package_dsl_subagents.py",
+        "partition_plan": "stage:02_partition/output/partition_plan.json",
+        "golden_manifest": "stage:03_torch_golden/output/golden_manifest.json",
+        "package_dir": "stages/05_dsl_partitions/subagent_packages"
+      },
       "input_refs": [
         "stage:01_torch_export/output/model_ir.json",
         "stage:02_partition/output/partition_plan.json",
@@ -152,6 +159,7 @@
         "target_dsl/**"
       ],
       "required_outputs": [
+        "output/subagent_task_manifest.json",
         "output/partition_impl_manifest.json",
         "output/dsl_progress.json",
         "output/partition_correctness_report.json",

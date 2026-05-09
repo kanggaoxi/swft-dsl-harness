@@ -57,6 +57,38 @@ python3 harness/scripts/advance_stage.py --workspace harness/work
 
 每个阶段都按这个顺序循环：打包 -> agent 工作 -> 验证 -> 推进。
 
+## DSL 子图并行实现
+
+`05_dsl_partitions` 阶段由主 agent 负责协调多个 subagent。主 agent 先生成每个
+partition 的独立任务包：
+
+```bash
+python3 harness/scripts/package_dsl_subagents.py --workspace harness/work --clean
+```
+
+生成结果位于：
+
+```text
+harness/work/stages/05_dsl_partitions/subagent_packages/<partition_id>/
+```
+
+每个 subagent 只读取自己包里的 `partition.json`、`INPUT_MANIFEST.json` 和
+`OUTPUT_CONTRACT.json`，并且只写自己的输出目录：
+
+```text
+harness/work/stages/05_dsl_partitions/output/partitions/<partition_id>/
+```
+
+主 agent 收集通过验证的子图实现后，再写出：
+
+```text
+harness/work/stages/05_dsl_partitions/output/partition_impl_manifest.json
+harness/work/stages/05_dsl_partitions/output/dsl_progress.json
+harness/work/stages/05_dsl_partitions/output/partition_correctness_report.json
+```
+
+这样可以让多个 subagent 并行开发不同子图，同时避免互相修改同一批文件。
+
 ## 契约
 
 每个阶段只拥有自己的目录：

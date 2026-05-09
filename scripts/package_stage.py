@@ -68,6 +68,21 @@ def render_task(stage: dict, input_manifest: dict, output_contract: dict, valida
     ])
     for path in stage.get("allowed_edits", []):
         lines.append(f"- `{path}`")
+    if stage.get("subagent_packages", {}).get("enabled"):
+        lines.extend([
+            "",
+            "## Subagent Coordination",
+            "",
+            "This stage is expected to be coordinated by a main agent. The main agent should create one bounded task package per partition, then assign those packages to subagents with disjoint ownership.",
+            "",
+            "Generate partition subagent packages from the repository root with:",
+            "",
+            "```bash",
+            f"python3 {stage['subagent_packages']['script']} --workspace harness/work",
+            "```",
+            "",
+            "Each subagent package contains a single `partition.json`, the shared manifests, and a strict output contract. Subagents should not modify files owned by other partitions.",
+        ])
     lines.extend([
         "",
         "Do not modify upstream stage outputs, golden files, pipeline config, or harness scripts unless this task explicitly says so.",
