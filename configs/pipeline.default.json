@@ -1,0 +1,215 @@
+{
+  "version": 2,
+  "route": "B",
+  "latency_target_us": 200,
+  "accuracy": {
+    "rtol": 4e-5,
+    "reference": "PyTorch fp32",
+    "target": "SWFT fp16"
+  },
+  "external_inputs": [
+    {
+      "label": "torch_model_source",
+      "path": "shared/model/model.py",
+      "required_for": ["01_torch_export"]
+    },
+    {
+      "label": "torch_weights",
+      "path": "shared/model/weights.pth",
+      "required_for": ["01_torch_export", "03_torch_golden"]
+    },
+    {
+      "label": "input_spec",
+      "path": "shared/model/input_spec.json",
+      "required_for": ["01_torch_export", "03_torch_golden"]
+    },
+    {
+      "label": "similar_model_dsl",
+      "path": "shared/similar_dsl/similar_model_dsl.py",
+      "required_for": ["02_partition", "04_dsl_skeleton", "05_dsl_partitions", "06_dsl_integrate", "07_perf"]
+    },
+    {
+      "label": "swft_flow_doc",
+      "path": "docs/SWFT_DSL_FLOW.md",
+      "required_for": ["04_dsl_skeleton", "05_dsl_partitions", "06_dsl_integrate", "07_perf"],
+      "relative_to": "harness"
+    }
+  ],
+  "stages": [
+    {
+      "id": "01_torch_export",
+      "name": "Torch IR export and validation",
+      "agent_role": "Torch export agent",
+      "objective": "Build a deterministic exporter around the trusted PyTorch model. Export a machine-readable IR, node manifest, weight map, and torch runner. Validate the exported artifacts against the original PyTorch model before downstream stages consume them.",
+      "input_refs": [
+        "external:torch_model_source",
+        "external:torch_weights",
+        "external:input_spec"
+      ],
+      "allowed_edits": [
+        "stages/01_torch_export/output/**",
+        "stages/01_torch_export/logs/**"
+      ],
+      "required_outputs": [
+        "output/model_ir.json",
+        "output/node_manifest.json",
+        "output/weight_map.json",
+        "output/torch_runner.py",
+        "output/export_validation_report.json",
+        "output/validation_notes.md"
+      ],
+      "validation_commands": []
+    },
+    {
+      "id": "02_partition",
+      "name": "IR partition plan",
+      "agent_role": "Partition planning agent",
+      "objective": "Split the validated machine-generated Torch IR into SWFT-friendly partitions. Do not reinterpret the original PyTorch source unless the IR validation report explicitly marks an ambiguity.",
+      "input_refs": [
+        "stage:01_torch_export/output/model_ir.json",
+        "stage:01_torch_export/output/node_manifest.json",
+        "stage:01_torch_export/output/weight_map.json",
+        "stage:01_torch_export/output/export_validation_report.json",
+        "external:similar_model_dsl"
+      ],
+      "allowed_edits": [
+        "stages/02_partition/output/**",
+        "stages/02_partition/logs/**"
+      ],
+      "required_outputs": [
+        "output/partition_plan.json",
+        "output/partition_plan.md",
+        "output/validation_notes.md"
+      ],
+      "validation_commands": []
+    },
+    {
+      "id": "03_torch_golden",
+      "name": "Torch per-partition golden generation",
+      "agent_role": "Torch golden generation agent",
+      "objective": "Use the validated torch runner and partition plan to capture deterministic per-partition input and output bins directly from the trusted PyTorch model.",
+      "input_refs": [
+        "external:torch_weights",
+        "external:input_spec",
+        "stage:01_torch_export/output/model_ir.json",
+        "stage:01_torch_export/output/node_manifest.json",
+        "stage:01_torch_export/output/torch_runner.py",
+        "stage:02_partition/output/partition_plan.json"
+      ],
+      "allowed_edits": [
+        "stages/03_torch_golden/output/**",
+        "stages/03_torch_golden/logs/**"
+      ],
+      "required_outputs": [
+        "output/golden_manifest.json",
+        "output/cases",
+        "output/torch_golden_report.json",
+        "output/validation_notes.md"
+      ],
+      "validation_commands": []
+    },
+    {
+      "id": "04_dsl_skeleton",
+      "name": "SWFT DSL skeleton",
+      "agent_role": "DSL skeleton agent",
+      "objective": "Create a minimal SWFT DSL harness that proves compile, run, file input, and file output work before real partition implementation starts. The skeleton should exercise GM->UB->GM for the first suitable tensor.",
+      "input_refs": [
+        "stage:02_partition/output/partition_plan.json",
+        "stage:03_torch_golden/output/golden_manifest.json",
+        "stage:03_torch_golden/output/cases",
+        "external:similar_model_dsl",
+        "external:swft_flow_doc"
+      ],
+      "allowed_edits": [
+        "stages/04_dsl_skeleton/output/**",
+        "stages/04_dsl_skeleton/logs/**",
+        "target_dsl/**"
+      ],
+      "required_outputs": [
+        "output/target_model_dsl.py",
+        "output/skeleton_run_report.json",
+        "output/validation_notes.md"
+      ],
+      "validation_commands": []
+    },
+    {
+      "id": "05_dsl_partitions",
+      "name": "SWFT DSL partition implementations",
+      "agent_role": "DSL main implementation agent",
+      "objective": "The main agent coordinates multiple subagents. Each subagent implements one or more disjoint partitions using the partition plan and torch-generated golden bins. The main agent integrates accepted partition implementations.",
+      "input_refs": [
+        "stage:01_torch_export/output/model_ir.json",
+        "stage:02_partition/output/partition_plan.json",
+        "stage:03_torch_golden/output/golden_manifest.json",
+        "stage:03_torch_golden/output/cases",
+        "stage:04_dsl_skeleton/output/target_model_dsl.py",
+        "external:similar_model_dsl",
+        "external:swft_flow_doc"
+      ],
+      "allowed_edits": [
+        "stages/05_dsl_partitions/output/**",
+        "stages/05_dsl_partitions/logs/**",
+        "target_dsl/**"
+      ],
+      "required_outputs": [
+        "output/partition_impl_manifest.json",
+        "output/dsl_progress.json",
+        "output/partition_correctness_report.json",
+        "output/validation_notes.md"
+      ],
+      "validation_commands": []
+    },
+    {
+      "id": "06_dsl_integrate",
+      "name": "Full DSL integration and correctness",
+      "agent_role": "DSL integration agent",
+      "objective": "Integrate all accepted partition implementations into a single full-model SWFT DSL program and validate final correctness against torch-generated outputs.",
+      "input_refs": [
+        "stage:01_torch_export/output/model_ir.json",
+        "stage:02_partition/output/partition_plan.json",
+        "stage:03_torch_golden/output/golden_manifest.json",
+        "stage:05_dsl_partitions/output/partition_impl_manifest.json",
+        "stage:05_dsl_partitions/output/dsl_progress.json",
+        "external:swft_flow_doc"
+      ],
+      "allowed_edits": [
+        "stages/06_dsl_integrate/output/**",
+        "stages/06_dsl_integrate/logs/**",
+        "target_dsl/**"
+      ],
+      "required_outputs": [
+        "output/target_model_dsl.py",
+        "output/full_correctness_report.json",
+        "output/validation_notes.md"
+      ],
+      "validation_commands": []
+    },
+    {
+      "id": "07_perf",
+      "name": "Latency optimization",
+      "agent_role": "Performance optimization agent",
+      "objective": "Optimize the already-correct DSL until latency is within target while preserving the required accuracy.",
+      "input_refs": [
+        "stage:01_torch_export/output/model_ir.json",
+        "stage:02_partition/output/partition_plan.json",
+        "stage:03_torch_golden/output/golden_manifest.json",
+        "stage:06_dsl_integrate/output/target_model_dsl.py",
+        "stage:06_dsl_integrate/output/full_correctness_report.json",
+        "external:similar_model_dsl",
+        "external:swft_flow_doc"
+      ],
+      "allowed_edits": [
+        "stages/07_perf/output/**",
+        "stages/07_perf/logs/**",
+        "target_dsl/**"
+      ],
+      "required_outputs": [
+        "output/target_model_dsl.py",
+        "output/perf_report.json",
+        "output/optimization_log.md",
+        "output/validation_notes.md"
+      ],
+      "validation_commands": []
+    }
+  ]
+}
