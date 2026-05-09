@@ -27,7 +27,7 @@ DEFAULT_STAGE = "05_dsl_partitions"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--workspace", default="harness/work")
+    parser.add_argument("--workspace", default="work")
     parser.add_argument("--config", default=None)
     parser.add_argument("--stage", default=DEFAULT_STAGE)
     parser.add_argument("--partitions", default=None, help="Comma-separated partition ids to package. Defaults to all.")

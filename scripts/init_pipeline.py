@@ -11,7 +11,7 @@ from harness_common import DEFAULT_CONFIG, create_stage_dirs, init_state, load_c
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--workspace", default="harness/work")
+    parser.add_argument("--workspace", default="work")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()

@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-HARNESS_ROOT = REPO_ROOT / "harness"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+HARNESS_ROOT = REPO_ROOT
 DEFAULT_CONFIG = HARNESS_ROOT / "configs" / "pipeline.default.json"
 
 

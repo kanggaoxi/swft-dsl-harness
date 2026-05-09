@@ -25,15 +25,15 @@ agent 之间不直接对话。编排器只把已经验证通过的文件传给�
 初始化工作区：
 
 ```bash
-python3 harness/scripts/init_pipeline.py --workspace harness/work
+python3 scripts/init_pipeline.py --workspace work
 ```
 
 把用户提供的输入放到下面这些位置：
 
 ```text
-harness/work/shared/model/model.py
-harness/work/shared/model/weights.pth
-harness/work/shared/similar_dsl/similar_model_dsl.py
+work/shared/model/model.py
+work/shared/model/weights.pth
+work/shared/similar_dsl/similar_model_dsl.py
 ```
 
 这里你只需要准备模型代码和权重。`input_spec.json` 会在 `01_torch_export`
@@ -42,20 +42,20 @@ harness/work/shared/similar_dsl/similar_model_dsl.py
 为当前阶段生成任务包：
 
 ```bash
-python3 harness/scripts/package_stage.py --workspace harness/work
+python3 scripts/package_stage.py --workspace work
 ```
 
 把生成的目录交给当前阶段的 agent：
 
 ```text
-harness/work/stages/01_torch_export/agent_package/
+work/stages/01_torch_export/agent_package/
 ```
 
 当 agent 在当前阶段的 `output/` 下写完文件后，执行：
 
 ```bash
-python3 harness/scripts/validate_stage.py --workspace harness/work --stage 01_torch_export
-python3 harness/scripts/advance_stage.py --workspace harness/work
+python3 scripts/validate_stage.py --workspace work --stage 01_torch_export
+python3 scripts/advance_stage.py --workspace work
 ```
 
 每个阶段都按这个顺序循环：打包 -> agent 工作 -> 验证 -> 推进。
@@ -65,8 +65,8 @@ python3 harness/scripts/advance_stage.py --workspace harness/work
 `package_stage.py` 不是为每个阶段写死一份任务文件。它会读取：
 
 ```text
-harness/work/pipeline_state.json
-harness/configs/pipeline.default.json
+work/pipeline_state.json
+configs/pipeline.default.json
 ```
 
 然后用“通用模板 + 当前阶段配置 + 当前工作区状态”生成当前阶段的任务包。
@@ -92,7 +92,7 @@ OUTPUT_CONTRACT.json 本阶段必须产出的文件清单
 VALIDATION.md        本阶段验收方式
 ```
 
-因此，真正控制每个阶段行为的是 `harness/configs/pipeline.default.json`，
+因此，真正控制每个阶段行为的是 `configs/pipeline.default.json`，
 不是一堆手写的独立 prompt。
 
 ## 验证失败怎么处理
@@ -100,7 +100,7 @@ VALIDATION.md        本阶段验收方式
 执行验证：
 
 ```bash
-python3 harness/scripts/validate_stage.py --workspace harness/work --stage <stage_id>
+python3 scripts/validate_stage.py --workspace work --stage <stage_id>
 ```
 
 验证程序会检查两类内容：
@@ -111,7 +111,7 @@ python3 harness/scripts/validate_stage.py --workspace harness/work --stage <stag
 如果失败，终端会打印缺少的文件或失败的命令，同时写出详细报告：
 
 ```text
-harness/work/stages/<stage_id>/validation/VALIDATION_REPORT.json
+work/stages/<stage_id>/validation/VALIDATION_REPORT.json
 ```
 
 失败后不要执行 `advance_stage.py`。正确处理方式是：
@@ -122,7 +122,7 @@ harness/work/stages/<stage_id>/validation/VALIDATION_REPORT.json
 4. 只有验证通过后，才执行：
 
 ```bash
-python3 harness/scripts/advance_stage.py --workspace harness/work
+python3 scripts/advance_stage.py --workspace work
 ```
 
 如果当前 agent 修不好，可以重新运行 `package_stage.py` 生成任务包，
@@ -134,28 +134,28 @@ python3 harness/scripts/advance_stage.py --workspace harness/work
 partition 的独立任务包：
 
 ```bash
-python3 harness/scripts/package_dsl_subagents.py --workspace harness/work --clean
+python3 scripts/package_dsl_subagents.py --workspace work --clean
 ```
 
 生成结果位于：
 
 ```text
-harness/work/stages/05_dsl_partitions/subagent_packages/<partition_id>/
+work/stages/05_dsl_partitions/subagent_packages/<partition_id>/
 ```
 
 每个 subagent 只读取自己包里的 `partition.json`、`INPUT_MANIFEST.json` 和
 `OUTPUT_CONTRACT.json`，并且只写自己的输出目录：
 
 ```text
-harness/work/stages/05_dsl_partitions/output/partitions/<partition_id>/
+work/stages/05_dsl_partitions/output/partitions/<partition_id>/
 ```
 
 主 agent 收集通过验证的子图实现后，再写出：
 
 ```text
-harness/work/stages/05_dsl_partitions/output/partition_impl_manifest.json
-harness/work/stages/05_dsl_partitions/output/dsl_progress.json
-harness/work/stages/05_dsl_partitions/output/partition_correctness_report.json
+work/stages/05_dsl_partitions/output/partition_impl_manifest.json
+work/stages/05_dsl_partitions/output/dsl_progress.json
+work/stages/05_dsl_partitions/output/partition_correctness_report.json
 ```
 
 这样可以让多个 subagent 并行开发不同子图，同时避免互相修改同一批文件。
@@ -165,7 +165,7 @@ harness/work/stages/05_dsl_partitions/output/partition_correctness_report.json
 每个阶段只拥有自己的目录：
 
 ```text
-harness/work/stages/<stage_id>/
+work/stages/<stage_id>/
   agent_package/
   output/
   logs/
@@ -173,7 +173,7 @@ harness/work/stages/<stage_id>/
 ```
 
 agent 应该只修改 `AGENT_TASK.md` 允许的文件。验证门会检查必需产物，
-以及 `harness/configs/pipeline.default.json` 中声明的可选验证命令。
+以及 `configs/pipeline.default.json` 中声明的可选验证命令。
 
 路线 B 的关键契约是：`01_torch_export` 的输出必须先通过验证门，后续阶段才允许消费
 `model_ir.json`、`node_manifest.json`、`weight_map.json` 和 `torch_runner.py`。

@@ -141,7 +141,7 @@
       "objective": "The main agent coordinates multiple subagents. Each subagent implements one or more disjoint partitions using the partition plan and torch-generated fp32 golden bins. The main agent integrates accepted partition implementations.",
       "subagent_packages": {
         "enabled": true,
-        "script": "harness/scripts/package_dsl_subagents.py",
+        "script": "scripts/package_dsl_subagents.py",
         "partition_plan": "stage:02_partition/output/partition_plan.json",
         "golden_manifest": "stage:03_torch_golden/output/golden_manifest.json",
         "package_dir": "stages/05_dsl_partitions/subagent_packages"

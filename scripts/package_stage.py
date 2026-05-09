@@ -24,7 +24,7 @@ from harness_common import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--workspace", default="harness/work")
+    parser.add_argument("--workspace", default="work")
     parser.add_argument("--config", default=None)
     parser.add_argument("--stage", default=None)
     parser.add_argument("--copy-inputs", action="store_true")
@@ -93,7 +93,7 @@ def render_task(stage: dict, input_manifest: dict, output_contract: dict, valida
             "Generate partition subagent packages from the repository root with:",
             "",
             "```bash",
-            f"python3 {stage['subagent_packages']['script']} --workspace harness/work",
+            f"python3 {stage['subagent_packages']['script']} --workspace work",
             "```",
             "",
             "Each subagent package contains a single `partition.json`, the shared manifests, and a strict output contract. Subagents should not modify files owned by other partitions.",
@@ -187,7 +187,7 @@ def render_validation(stage: dict) -> str:
     lines = [
         "After implementation, run the orchestrator validation gate from the repository root:",
         "",
-        f"```bash\npython3 harness/scripts/validate_stage.py --workspace harness/work --stage {stage['id']}\n```",
+        f"```bash\npython3 scripts/validate_stage.py --workspace work --stage {stage['id']}\n```",
         "",
         "The gate checks required output paths and any configured validation commands.",
     ]

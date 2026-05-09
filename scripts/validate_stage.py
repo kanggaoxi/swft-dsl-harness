@@ -23,7 +23,7 @@ from harness_common import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--workspace", default="harness/work")
+    parser.add_argument("--workspace", default="work")
     parser.add_argument("--config", default=None)
     parser.add_argument("--stage", default=None)
     return parser.parse_args()
