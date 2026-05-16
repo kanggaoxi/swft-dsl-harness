@@ -60,12 +60,11 @@ After the agent writes files under the stage output directory, run:
 
 ```bash
 python3 scripts/validate_stage.py --workspace work --stage 01_torch_export
-python3 scripts/package_judge.py --workspace work --stage 01_torch_export
 python3 scripts/validate_judge.py --workspace work --stage 01_torch_export
 python3 scripts/advance_stage.py --workspace work
 ```
 
-Repeat: package -> manually start an agent session with the task package -> agent work -> mechanical validation -> independent judge -> advance.
+Repeat: package both worker and judge tasks -> manually start a worker session with the worker package -> worker work -> mechanical validation -> manually start a judge session with the judge package -> judge validation -> advance.
 
 ## How Task Packages Are Built
 
@@ -97,17 +96,22 @@ quality_checks      worker self-checks before handoff
 Each task package always includes:
 
 ```text
-AGENT_TASK.md        task description for the agent
-INPUT_MANIFEST.json  input file manifest
-OUTPUT_CONTRACT.json required output contract
-VALIDATION.md        validation instructions
+agent_package/AGENT_TASK.md        worker task description
+agent_package/INPUT_MANIFEST.json  worker input manifest
+agent_package/OUTPUT_CONTRACT.json required worker output contract
+agent_package/VALIDATION.md        worker mechanical validation instructions
+judge_package/JUDGE_TASK.md        judge task description
+judge_package/JUDGE_INPUT_MANIFEST.json judge input manifest
+judge_package/JUDGE_GUIDE.md       general judge guide
 ```
 
 The stage configuration in `configs/pipeline.default.json` is what drives behavior.
 `AGENT_TASK.md` is intended to be complete enough that the worker agent does not
 need additional hand-written prompt text for that stage.
-`judge_checklist` is not rendered into the worker task. It is only rendered into
-the judge package so the worker cannot optimize directly against the judge checks.
+`AGENT_TASK.md` does not mention the judge or pipeline advancement. The worker
+stops after the current stage deliverables and mechanical validation. `judge_checklist`
+is only rendered into the judge package so the worker cannot optimize directly
+against the judge checks.
 
 ## Validation and Judge
 
@@ -128,14 +132,9 @@ If validation fails, it prints the missing files or failing commands and writes:
 work/stages/<stage_id>/validation/VALIDATION_REPORT.json
 ```
 
-After mechanical validation passes, create a judge package:
-
-```bash
-python3 scripts/package_judge.py --workspace work --stage <stage_id>
-```
-
-Give this directory to a fresh judge agent that did not inherit the worker
-agent's context:
+`package_stage.py` already created the independent judge package. After
+mechanical validation passes, give this directory to a fresh judge agent that did
+not inherit the worker agent's context:
 
 ```text
 work/stages/<stage_id>/judge_package/

@@ -28,8 +28,23 @@ def main() -> int:
     base = stage_dir(workspace, stage_id)
     report_path = base / "judge" / "JUDGE_REPORT.json"
     validation_path = base / "judge" / "JUDGE_VALIDATION_REPORT.json"
+    mechanical_report_path = base / "validation" / "VALIDATION_REPORT.json"
 
     errors: list[str] = []
+    stage_state = state["stages"][stage_id]
+    mechanical_report = None
+    if stage_state.get("status") != "passed":
+        errors.append(f"stage {stage_id} has not passed mechanical validation")
+    if not mechanical_report_path.exists():
+        errors.append(f"missing mechanical validation report: {mechanical_report_path}")
+    else:
+        try:
+            mechanical_report = load_json(mechanical_report_path)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"cannot parse mechanical validation report: {exc}")
+    if isinstance(mechanical_report, dict) and mechanical_report.get("passed") is not True:
+        errors.append("mechanical validation report is not passed")
+
     report = None
     if not report_path.exists():
         errors.append(f"missing judge report: {report_path}")
@@ -57,6 +72,8 @@ def main() -> int:
         "validated_at": now_iso(),
         "passed": passed,
         "errors": errors,
+        "mechanical_validation_report": str(mechanical_report_path.resolve()),
+        "mechanical_validation_passed": mechanical_report.get("passed") if isinstance(mechanical_report, dict) else None,
         "judge_report": str(report_path.resolve()),
         "judge_passed_field": report.get("passed") if isinstance(report, dict) else None,
         "findings": findings,
@@ -64,7 +81,6 @@ def main() -> int:
     }
     save_json(validation_path, validation)
 
-    stage_state = state["stages"][stage_id]
     stage_state["last_judge_report"] = str(report_path.resolve())
     stage_state["judge_validation_report"] = str(validation_path.resolve())
     stage_state["judge_passed"] = passed

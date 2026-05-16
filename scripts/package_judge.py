@@ -70,7 +70,7 @@ def render_judge_task(stage: dict, manifest: dict, precision: dict) -> str:
         "",
         "1. `JUDGE_INPUT_MANIFEST.json` for all available paths.",
         "2. `JUDGE_GUIDE.md` for general judging rules.",
-        "3. The stage outputs listed in `stage_output_checks`.",
+        "3. The stage output paths listed in `stage_output_checks`. Re-check these paths on disk; any existence flags may reflect packaging time.",
         "4. The stage-specific checklist below.",
         "",
         "## Stage-Specific Checklist",
@@ -126,6 +126,8 @@ def main() -> int:
         shutil.rmtree(package)
     package.mkdir(parents=True, exist_ok=True)
     judge_dir = base / "judge"
+    if judge_dir.exists():
+        shutil.rmtree(judge_dir)
     judge_dir.mkdir(parents=True, exist_ok=True)
 
     input_refs = [resolve_input_ref(config, ref, workspace) for ref in stage.get("input_refs", [])]

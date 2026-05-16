@@ -59,12 +59,11 @@ work/stages/01_torch_export/agent_package/
 
 ```bash
 python3 scripts/validate_stage.py --workspace work --stage 01_torch_export
-python3 scripts/package_judge.py --workspace work --stage 01_torch_export
 python3 scripts/validate_judge.py --workspace work --stage 01_torch_export
 python3 scripts/advance_stage.py --workspace work
 ```
 
-每个阶段都按这个顺序循环：打包 -> 人手动开启 agent 会话并交付任务包 -> agent 工作 -> 机械验证 -> 独立 judge -> 推进。
+每个阶段都按这个顺序循环：打包 worker/judge 两个任务包 -> 人手动开启 worker 会话并交付 worker 包 -> worker 工作 -> 机械验证 -> 人手动开启 judge 会话并交付 judge 包 -> judge 验收 -> 推进。
 
 ## 任务包是怎么生成的
 
@@ -94,17 +93,21 @@ quality_checks      agent 交付前自检项
 生成的任务包固定包含：
 
 ```text
-AGENT_TASK.md        给 agent 看的任务说明
-INPUT_MANIFEST.json  本阶段输入文件清单
-OUTPUT_CONTRACT.json 本阶段必须产出的文件清单
-VALIDATION.md        本阶段验收方式
+agent_package/AGENT_TASK.md        给 worker agent 看的任务说明
+agent_package/INPUT_MANIFEST.json  本阶段 worker 输入文件清单
+agent_package/OUTPUT_CONTRACT.json 本阶段 worker 必须产出的文件清单
+agent_package/VALIDATION.md        worker 可执行的机械验证方式
+judge_package/JUDGE_TASK.md        给 judge agent 看的验收任务说明
+judge_package/JUDGE_INPUT_MANIFEST.json judge 可读取路径清单
+judge_package/JUDGE_GUIDE.md       judge 通用验收指南
 ```
 
-`AGENT_TASK.md` 会把当前阶段的目标、输入路径、操作步骤、自检项和验收流程写进去。
+`AGENT_TASK.md` 会把当前阶段的目标、输入路径、操作步骤、自检项和机械验证方式写进去。
 目标是让阶段 agent 拿到任务包后不需要人再额外补 prompt。
 
-`judge_checklist` 不会写入 worker 的 `AGENT_TASK.md`。它只会进入 judge package，
-避免 worker agent 围绕 judge 检查项做表面满足。
+`AGENT_TASK.md` 不会提到 judge，也不会提到推进流水线。worker agent 完成当前阶段
+交付和机械验证后应停止。`judge_checklist` 只会进入 judge package，避免 worker
+agent 围绕 judge 检查项做表面满足。
 
 因此，真正控制每个阶段行为的是 `configs/pipeline.default.json`，
 不是一堆手写的独立 prompt。
@@ -128,13 +131,8 @@ python3 scripts/validate_stage.py --workspace work --stage <stage_id>
 work/stages/<stage_id>/validation/VALIDATION_REPORT.json
 ```
 
-机械验证通过后，还要创建独立 judge 任务包：
-
-```bash
-python3 scripts/package_judge.py --workspace work --stage <stage_id>
-```
-
-把下面目录交给一个没有继承干活 agent 上下文的新 judge agent：
+`package_stage.py` 在一开始已经生成了独立 judge 任务包。机械验证通过后，把下面目录
+交给一个没有继承干活 agent 上下文的新 judge agent：
 
 ```text
 work/stages/<stage_id>/judge_package/
@@ -159,7 +157,7 @@ python3 scripts/validate_judge.py --workspace work --stage <stage_id>
 1. 打开 `VALIDATION_REPORT.json`，确认缺少什么或哪个命令失败。
 2. 把失败报告交给当前阶段 agent，让它只修当前阶段允许修改的文件。
 3. 如果是 judge 失败，把 `JUDGE_REPORT.json` 交给当前阶段 agent 修复。
-4. 修完后再次执行 `validate_stage.py`、`package_judge.py` 和 `validate_judge.py`。
+4. 修完后再次执行 `validate_stage.py` 和 `validate_judge.py`。
 5. 只有两道门都通过后，才执行：
 
 ```bash

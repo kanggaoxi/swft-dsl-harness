@@ -14,12 +14,14 @@ from harness_common import (
     load_state,
     now_iso,
     previous_stage_id,
+    required_output_status,
     resolve_input_ref,
     save_json,
     save_state,
     stage_by_id,
     stage_dir,
 )
+from package_judge import render_judge_task
 
 
 def parse_args() -> argparse.Namespace:
@@ -181,6 +183,14 @@ def main() -> int:
     if package.exists():
         shutil.rmtree(package)
     package.mkdir(parents=True, exist_ok=True)
+    judge_package = base / "judge_package"
+    if judge_package.exists():
+        shutil.rmtree(judge_package)
+    judge_package.mkdir(parents=True, exist_ok=True)
+    judge_dir = base / "judge"
+    if judge_dir.exists():
+        shutil.rmtree(judge_dir)
+    judge_dir.mkdir(parents=True, exist_ok=True)
 
     inputs = []
     for ref in stage.get("input_refs", []):
@@ -212,19 +222,46 @@ def main() -> int:
         encoding="utf-8",
     )
 
+    judge_manifest = {
+        "stage": stage_id,
+        "created_at": now_iso(),
+        "workspace": str(workspace),
+        "precision": config.get("precision", {}),
+        "stage_objective": stage.get("objective", ""),
+        "stage_input_refs": inputs,
+        "stage_output_checks": [
+            required_output_status(base, rel_path)
+            for rel_path in stage.get("required_outputs", [])
+        ],
+        "mechanical_validation_report": str((base / "validation" / "VALIDATION_REPORT.json").resolve()),
+        "mechanical_validation_exists": (base / "validation" / "VALIDATION_REPORT.json").exists(),
+        "judge_guide": str((Path(__file__).resolve().parents[1] / "docs" / "JUDGE_GUIDE-CH.md").resolve()),
+        "judge_report": str((judge_dir / "JUDGE_REPORT.json").resolve()),
+    }
+    save_json(judge_package / "JUDGE_INPUT_MANIFEST.json", judge_manifest)
+    (judge_package / "JUDGE_TASK.md").write_text(
+        render_judge_task(stage, judge_manifest, config.get("precision", {})),
+        encoding="utf-8",
+    )
+    guide = Path(judge_manifest["judge_guide"])
+    if guide.exists():
+        shutil.copy2(guide, judge_package / "JUDGE_GUIDE.md")
+
     stage_state["status"] = "packaged"
     stage_state["attempts"] = int(stage_state.get("attempts", 0)) + 1
     stage_state["package_path"] = str(package.resolve())
+    stage_state["judge_package_path"] = str(judge_package.resolve())
     state["updated_at"] = now_iso()
     save_state(workspace, state)
 
     print(f"packaged stage {stage_id}: {package}")
+    print(f"packaged judge for {stage_id}: {judge_package}")
     return 0
 
 
 def render_validation(stage: dict) -> str:
     lines = [
-        "After implementation, run the orchestrator validation gate from the repository root:",
+        "After implementation, run the mechanical validation gate from the repository root if you have shell access:",
         "",
         f"```bash\npython3 scripts/validate_stage.py --workspace work --stage {stage['id']}\n```",
         "",
@@ -239,20 +276,7 @@ def render_validation(stage: dict) -> str:
         lines.extend(["", "No stage-specific validation commands are configured yet. Required output files are still checked."])
     lines.extend([
         "",
-        "After the mechanical gate passes, create an independent judge package:",
-        "",
-        f"```bash\npython3 scripts/package_judge.py --workspace work --stage {stage['id']}\n```",
-        "",
-        "Give `stages/"
-        f"{stage['id']}/judge_package/` to a fresh judge agent that has not inherited this worker agent's context.",
-        "The judge must write `stages/"
-        f"{stage['id']}/judge/JUDGE_REPORT.json`.",
-        "",
-        "Then run:",
-        "",
-        f"```bash\npython3 scripts/validate_judge.py --workspace work --stage {stage['id']}\n```",
-        "",
-        "Only after both validation and judge pass should the pipeline advance.",
+        "Stop after this stage's deliverables and mechanical validation. Do not start other agents or advance the pipeline. The human orchestrator handles any later steps outside this worker task.",
     ])
     return "\n".join(lines)
 
