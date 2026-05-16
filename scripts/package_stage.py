@@ -32,6 +32,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def append_numbered(lines: list[str], title: str, items: list[str]) -> None:
+    if not items:
+        return
+    lines.extend(["", f"## {title}", ""])
+    for idx, item in enumerate(items, start=1):
+        lines.append(f"{idx}. {item}")
+
+
+def append_bullets(lines: list[str], title: str, items: list[str]) -> None:
+    if not items:
+        return
+    lines.extend(["", f"## {title}", ""])
+    for item in items:
+        lines.append(f"- {item}")
+
+
 def render_task(stage: dict, input_manifest: dict, output_contract: dict, validation_text: str, precision: dict | None = None) -> str:
     lines = [
         f"# Agent Task: {stage['id']} - {stage['name']}",
@@ -50,14 +66,26 @@ def render_task(stage: dict, input_manifest: dict, output_contract: dict, valida
         "",
     ]
     if precision:
-        lines.extend([
-            f"- model entry inputs and weights: `{precision.get('model_input_dtype', 'unspecified')}`",
-            f"- torch reference and golden outputs: `{precision.get('torch_reference_dtype', 'unspecified')}`",
-            f"- SWFT DSL runtime: `{precision.get('dsl_runtime_dtype', 'unspecified')}`",
-            f"- comparison metric: `{precision.get('comparison_metric', 'unspecified')}`",
-            f"- required tolerance: `{precision.get('comparison_rtol', 'unspecified')}`",
-            "",
-        ])
+        if "weight_dtype_policy" in precision:
+            lines.extend([
+                f"- weight dtype policy: `{precision.get('weight_dtype_policy', 'unspecified')}`",
+                f"- model input dtype policy: `{precision.get('model_input_dtype_policy', 'unspecified')}`",
+                f"- golden dtype policy: `{precision.get('golden_dtype_policy', 'unspecified')}`",
+                f"- DSL model IO dtype policy: `{precision.get('dsl_model_io_dtype_policy', 'unspecified')}`",
+                f"- final comparison: `{precision.get('final_comparison_metric', 'unspecified')}` <= `{precision.get('final_comparison_rtol', 'unspecified')}`",
+                f"- partition comparison default: `{precision.get('partition_comparison_metric', 'unspecified')}` <= `{precision.get('partition_comparison_default_rtol', 'unspecified')}`",
+                f"- partition documented override allowed: `{precision.get('partition_allow_documented_override', False)}`",
+                "",
+            ])
+        else:
+            lines.extend([
+                f"- model entry inputs and weights: `{precision.get('model_input_dtype', 'unspecified')}`",
+                f"- torch reference and golden outputs: `{precision.get('torch_reference_dtype', 'unspecified')}`",
+                f"- SWFT DSL runtime: `{precision.get('dsl_runtime_dtype', 'unspecified')}`",
+                f"- comparison metric: `{precision.get('comparison_metric', 'unspecified')}`",
+                f"- required tolerance: `{precision.get('comparison_rtol', 'unspecified')}`",
+                "",
+            ])
     else:
         lines.extend(["No precision contract is configured for this pipeline.", ""])
     lines.extend([
@@ -75,6 +103,17 @@ def render_task(stage: dict, input_manifest: dict, output_contract: dict, valida
         for item in missing:
             lines.append(f"- `{item['label']}`: `{item['path']}`")
         lines.append("")
+    existing = [item for item in input_manifest["inputs"] if item["exists"]]
+    if existing:
+        lines.extend([
+            "Available input paths:",
+            "",
+        ])
+        for item in existing:
+            lines.append(f"- `{item['label']}`: `{item['path']}`")
+        lines.append("")
+    append_numbered(lines, "Procedure", stage.get("procedure", []))
+    append_bullets(lines, "Quality Checks Before Handoff", stage.get("quality_checks", []))
     lines.extend([
         "## Allowed Edits",
         "",
@@ -189,7 +228,7 @@ def render_validation(stage: dict) -> str:
         "",
         f"```bash\npython3 scripts/validate_stage.py --workspace work --stage {stage['id']}\n```",
         "",
-        "The gate checks required output paths and any configured validation commands.",
+        "The mechanical gate checks required output paths and any configured validation commands.",
     ]
     commands = stage.get("validation_commands", [])
     if commands:
@@ -198,6 +237,23 @@ def render_validation(stage: dict) -> str:
             lines.append(f"- `{command}`")
     else:
         lines.extend(["", "No stage-specific validation commands are configured yet. Required output files are still checked."])
+    lines.extend([
+        "",
+        "After the mechanical gate passes, create an independent judge package:",
+        "",
+        f"```bash\npython3 scripts/package_judge.py --workspace work --stage {stage['id']}\n```",
+        "",
+        "Give `stages/"
+        f"{stage['id']}/judge_package/` to a fresh judge agent that has not inherited this worker agent's context.",
+        "The judge must write `stages/"
+        f"{stage['id']}/judge/JUDGE_REPORT.json`.",
+        "",
+        "Then run:",
+        "",
+        f"```bash\npython3 scripts/validate_judge.py --workspace work --stage {stage['id']}\n```",
+        "",
+        "Only after both validation and judge pass should the pipeline advance.",
+    ])
     return "\n".join(lines)
 
 

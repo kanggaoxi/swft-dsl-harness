@@ -1,23 +1,35 @@
 {
-  "version": 2,
+  "version": 3,
   "route": "B",
   "latency_target_us": 200,
+  "judge": {
+    "enabled": true
+  },
   "precision": {
-    "model_input_dtype": "fp32",
-    "torch_reference_dtype": "fp32",
-    "dsl_runtime_dtype": "fp16",
-    "comparison_metric": "relative_error",
-    "comparison_rtol": 4e-5
+    "weight_dtype_policy": "from_checkpoint",
+    "model_input_dtype_policy": "from_input_spec",
+    "golden_dtype_policy": "follow_model_runtime",
+    "dsl_model_io_dtype_policy": "match_golden_model_io",
+    "final_comparison_metric": "relative_error",
+    "final_comparison_rtol": 4e-5,
+    "partition_comparison_metric": "relative_error",
+    "partition_comparison_default_rtol": 4e-5,
+    "partition_allow_documented_override": true
   },
   "accuracy": {
     "rtol": 4e-5,
-    "reference": "PyTorch fp32",
-    "target": "SWFT fp16"
+    "reference": "PyTorch model runtime following checkpoint and input_spec dtypes",
+    "target": "SWFT DSL model input/output dtypes matching golden model input/output dtypes"
   },
   "external_inputs": [
     {
       "label": "torch_model_source",
       "path": "shared/model/model.py",
+      "required_for": ["01_torch_export"]
+    },
+    {
+      "label": "torch_model_config",
+      "path": "shared/model/model_config.json",
       "required_for": ["01_torch_export"]
     },
     {
@@ -32,8 +44,26 @@
     },
     {
       "label": "swft_flow_doc",
-      "path": "docs/SWFT_DSL_FLOW.md",
+      "path": "docs/SWFT_DSL_FLOW-CH.md",
       "required_for": ["04_dsl_skeleton", "05_dsl_partitions", "06_dsl_integrate", "07_perf"],
+      "relative_to": "harness"
+    },
+    {
+      "label": "swft_impl_notes",
+      "path": "docs/SWFT_IMPLEMENTATION_NOTES-CH.md",
+      "required_for": ["02_partition", "04_dsl_skeleton", "05_dsl_partitions", "06_dsl_integrate", "07_perf"],
+      "relative_to": "harness"
+    },
+    {
+      "label": "swft_perf_guide",
+      "path": "docs/SWFT_PERF_GUIDE-CH.md",
+      "required_for": ["07_perf"],
+      "relative_to": "harness"
+    },
+    {
+      "label": "swft_interface_flow",
+      "path": "docs/SWFT_INTERFACE_FLOW-CH.md",
+      "required_for": ["07_perf"],
       "relative_to": "harness"
     }
   ],
@@ -42,14 +72,37 @@
       "id": "01_torch_export",
       "name": "Torch IR export and validation",
       "agent_role": "Torch export agent",
-      "objective": "Build a deterministic exporter around the trusted PyTorch model. Infer and export input_spec.json from the model code and weights, then export a machine-readable IR, node manifest, weight map, and torch runner. Validate the exported artifacts against the original PyTorch model before downstream stages consume them.",
+      "objective": "Build a deterministic exporter around the trusted PyTorch model. Use model_config.json to locate the target class, constructor kwargs, and entry method. Infer and export input_spec.json from the model code and weights, then export a machine-readable IR, node manifest, weight map, and torch runner. Validate the exported artifacts against the original PyTorch model before downstream stages consume them.",
       "input_refs": [
         "external:torch_model_source",
+        "external:torch_model_config",
         "external:torch_weights"
       ],
       "allowed_edits": [
         "stages/01_torch_export/output/**",
         "stages/01_torch_export/logs/**"
+      ],
+      "procedure": [
+        "Read model_config.json first. Treat model_class, model_kwargs, entry_method, and state_dict_path as the authoritative model entry configuration.",
+        "Load model.py, instantiate the configured class with model_kwargs, load weights.pth, switch to eval mode, and disable gradients.",
+        "Infer model entry inputs and write input_spec.json with names, shapes, dtypes, construction method, and reproducibility seed.",
+        "Export model_ir.json, node_manifest.json, and weight_map.json from the trusted PyTorch execution path.",
+        "Write torch_runner.py so downstream stages can run the model and capture intermediates without rereading full model.py.",
+        "Run validation that compares the exported runner and IR assumptions against the original PyTorch model, then write export_validation_report.json."
+      ],
+      "quality_checks": [
+        "Do not ask the user for input_spec.json; this stage owns generating it.",
+        "Do not hard-code a class name from model.py if model_config.json provides one.",
+        "Record every checkpoint tensor's dtype and shape in weight_map.json; do not silently cast weights to fp32.",
+        "input_spec.json must explicitly define model entry input dtype, shape, seed, and construction method.",
+        "The exported runner must be deterministic and usable by later stages."
+      ],
+      "judge_checklist": [
+        "model_config.json fields were actually used to instantiate and call the model.",
+        "input_spec.json is derived from the model entry and contains enough information to recreate inputs.",
+        "weight_map.json records checkpoint dtype and shape for every weight tensor.",
+        "torch_runner.py can load weights and invoke the configured entry_method.",
+        "model_ir.json, node_manifest.json, and weight_map.json are consistent with export_validation_report.json."
       ],
       "required_outputs": [
         "output/model_ir.json",
@@ -72,11 +125,32 @@
         "stage:01_torch_export/output/node_manifest.json",
         "stage:01_torch_export/output/weight_map.json",
         "stage:01_torch_export/output/export_validation_report.json",
-        "external:similar_model_dsl"
+        "external:similar_model_dsl",
+        "external:swft_impl_notes"
       ],
       "allowed_edits": [
         "stages/02_partition/output/**",
         "stages/02_partition/logs/**"
+      ],
+      "procedure": [
+        "Read the validated IR, node manifest, weight map, and export validation report.",
+        "Read the similar DSL only for implementation patterns and likely fusion boundaries, not as a semantic source for the target model.",
+        "Create partitions that cover the full IR with explicit inputs, outputs, dependencies, node ids, dtypes, and shapes.",
+        "For every partition, write semantic_deps, implementation_deps, fusion_group, can_implement_independently, input_contract, and output_contract.",
+        "Mark fusion opportunities, cube/matmul regions, expected tiling axes, and SWFT implementation risks such as concat plus non-regular nd_to_nz.",
+        "Write partition_plan.json for machines and partition_plan.md for humans."
+      ],
+      "quality_checks": [
+        "Every IR node is assigned to exactly one partition unless explicitly documented as metadata or no-op.",
+        "Partition boundaries expose all cross-partition tensors.",
+        "The plan considers SWFT alignment and fusion constraints before DSL implementation starts."
+      ],
+      "judge_checklist": [
+        "The partition plan covers the complete validated IR without duplicate ownership.",
+        "Each partition has clear inputs, outputs, node list, shape/dtype metadata, and dependencies.",
+        "Each partition declares semantic_deps and implementation_deps so stage 05 can decide which subagents can run in parallel.",
+        "The plan uses SWFT implementation notes to flag risky concat, transpose, matmul, and padding areas.",
+        "The plan does not depend on rereading full PyTorch source for normal downstream work."
       ],
       "required_outputs": [
         "output/partition_plan.json",
@@ -89,7 +163,7 @@
       "id": "03_torch_golden",
       "name": "Torch per-partition golden generation",
       "agent_role": "Torch golden generation agent",
-      "objective": "Use the validated torch runner, inferred input_spec, and partition plan to capture deterministic per-partition input and output bins directly from the trusted PyTorch model in fp32.",
+      "objective": "Use the validated torch runner, inferred input_spec, and partition plan to capture deterministic per-partition input and output bins directly from the trusted PyTorch model, following checkpoint and input_spec dtypes.",
       "input_refs": [
         "external:torch_weights",
         "stage:01_torch_export/output/model_ir.json",
@@ -101,6 +175,26 @@
       "allowed_edits": [
         "stages/03_torch_golden/output/**",
         "stages/03_torch_golden/logs/**"
+      ],
+      "procedure": [
+        "Use torch_runner.py and input_spec.json to construct deterministic model inputs with exactly the dtypes recorded in input_spec.json.",
+        "Run the trusted PyTorch model following the checkpoint tensor dtypes and input_spec dtypes; do not force fp32 unless those artifacts require fp32.",
+        "Write binary files under output/cases with stable names and record all paths in golden_manifest.json.",
+        "Record dtype, shape, byte order, partition id, source node ids, random seed, and whether the tensor is model IO or partition intermediate for every bin.",
+        "Write torch_golden_report.json with reproducibility and sanity-check details."
+      ],
+      "quality_checks": [
+        "Golden outputs must come from PyTorch model runtime, not NumPy and not DSL.",
+        "Model-level DSL inputs and outputs must use the same dtype as the model-level golden inputs and outputs.",
+        "Manifest paths must exist and point to non-empty files.",
+        "Every partition in partition_plan.json must have corresponding golden inputs and outputs."
+      ],
+      "judge_checklist": [
+        "golden_manifest.json covers all partitions and full-model outputs.",
+        "All recorded bins exist, are non-empty, and have dtype/shape metadata.",
+        "torch_golden_report.json shows the runner followed checkpoint dtypes and input_spec dtypes.",
+        "The manifest makes model IO dtypes explicit so DSL execution can match them.",
+        "No golden is generated from DSL or from a hand-written NumPy reference."
       ],
       "required_outputs": [
         "output/golden_manifest.json",
@@ -120,12 +214,31 @@
         "stage:03_torch_golden/output/golden_manifest.json",
         "stage:03_torch_golden/output/cases",
         "external:similar_model_dsl",
-        "external:swft_flow_doc"
+        "external:swft_flow_doc",
+        "external:swft_impl_notes"
       ],
       "allowed_edits": [
         "stages/04_dsl_skeleton/output/**",
         "stages/04_dsl_skeleton/logs/**",
         "target_dsl/**"
+      ],
+      "procedure": [
+        "Read SWFT_DSL_FLOW and SWFT_IMPLEMENTATION_NOTES before writing DSL.",
+        "Pick the first suitable tensor from golden_manifest.json and build a minimal GM input -> UB -> GM output path.",
+        "Use slice_to_ub for reading and insert_to_gm for writing unless a documented reason requires otherwise.",
+        "Call compile_kernel and exec_kernel, confirm .cce, generated main.cpp, actual output bin, and comparison result.",
+        "Write target_model_dsl.py and skeleton_run_report.json with commands, paths, device id, and pass/fail details."
+      ],
+      "quality_checks": [
+        "This stage should not implement real model math beyond the IO skeleton.",
+        "The skeleton must prove file input, file output, compile, and execution all work.",
+        "The report must state where .cce, generated main.cpp, input bin, golden bin, and actual bin were produced."
+      ],
+      "judge_checklist": [
+        "target_model_dsl.py contains a real compile_kernel and exec_kernel path.",
+        "The skeleton performs GM -> UB -> GM and uses explicit file inputs/outputs.",
+        "skeleton_run_report.json contains actual command evidence and comparison result.",
+        "No real partition implementation is hidden in the skeleton stage."
       ],
       "required_outputs": [
         "output/target_model_dsl.py",
@@ -138,7 +251,7 @@
       "id": "05_dsl_partitions",
       "name": "SWFT DSL partition implementations",
       "agent_role": "DSL main implementation agent",
-      "objective": "The main agent coordinates multiple subagents. Each subagent implements one or more disjoint partitions using the partition plan and torch-generated fp32 golden bins. The main agent integrates accepted partition implementations.",
+      "objective": "The main agent coordinates multiple subagents. Each subagent implements one or more disjoint partitions using the partition plan and torch-generated golden bins. The main agent integrates accepted partition implementations.",
       "subagent_packages": {
         "enabled": true,
         "script": "scripts/package_dsl_subagents.py",
@@ -153,12 +266,36 @@
         "stage:03_torch_golden/output/cases",
         "stage:04_dsl_skeleton/output/target_model_dsl.py",
         "external:similar_model_dsl",
-        "external:swft_flow_doc"
+        "external:swft_flow_doc",
+        "external:swft_impl_notes"
       ],
       "allowed_edits": [
         "stages/05_dsl_partitions/output/**",
         "stages/05_dsl_partitions/logs/**",
         "target_dsl/**"
+      ],
+      "procedure": [
+        "Generate partition subagent packages with package_dsl_subagents.py.",
+        "Read subagent_task_manifest.json to distinguish ready_partitions and blocked_partitions.",
+        "For manual launch, open one fresh agent session per ready partition package and give it only that package path.",
+        "Do not launch blocked partitions until implementation_deps are resolved or the main agent groups them with their dependency/fusion group.",
+        "Require every subagent to compile, run, and compare its partition against torch-generated golden with the configured partition tolerance.",
+        "Subgraph tests should feed each DSL partition with torch-captured partition inputs so partition errors are isolated.",
+        "Review subagent outputs and integrate only partitions with passing correctness reports.",
+        "Write partition_impl_manifest.json, dsl_progress.json, partition_correctness_report.json, and validation_notes.md."
+      ],
+      "quality_checks": [
+        "Subagents must not edit each other's partition outputs.",
+        "Subagents must write only their partition-owned implementation.py, correctness_report.json, validation_notes.md, and artifacts.",
+        "Every implemented partition must have a correctness report with relative error or a documented override.",
+        "The main agent must clearly list accepted, rejected, blocked, and missing partitions."
+      ],
+      "judge_checklist": [
+        "subagent_task_manifest.json matches the partition plan.",
+        "subagent_task_manifest.json clearly separates ready_partitions and blocked_partitions.",
+        "partition_impl_manifest.json includes only partitions with evidence-backed correctness reports.",
+        "partition_correctness_report.json compares DSL actuals against torch-generated golden bins with the configured partition tolerance, or records a documented override.",
+        "dsl_progress.json clearly reports implemented and pending partitions."
       ],
       "required_outputs": [
         "output/subagent_task_manifest.json",
@@ -173,19 +310,38 @@
       "id": "06_dsl_integrate",
       "name": "Full DSL integration and correctness",
       "agent_role": "DSL integration agent",
-      "objective": "Integrate all accepted partition implementations into a single full-model SWFT DSL program and validate final correctness against torch-generated fp32 outputs while the DSL runs in fp16.",
+      "objective": "Integrate all accepted partition implementations into a single full-model SWFT DSL program and validate final correctness against torch-generated full-model outputs with matching model IO dtypes.",
       "input_refs": [
         "stage:01_torch_export/output/model_ir.json",
         "stage:02_partition/output/partition_plan.json",
         "stage:03_torch_golden/output/golden_manifest.json",
         "stage:05_dsl_partitions/output/partition_impl_manifest.json",
         "stage:05_dsl_partitions/output/dsl_progress.json",
-        "external:swft_flow_doc"
+        "external:swft_flow_doc",
+        "external:swft_impl_notes"
       ],
       "allowed_edits": [
         "stages/06_dsl_integrate/output/**",
         "stages/06_dsl_integrate/logs/**",
         "target_dsl/**"
+      ],
+      "procedure": [
+        "Integrate accepted partition implementations into one target_model_dsl.py.",
+        "Preserve the skeleton's compile and exec_kernel flow.",
+        "Run the full graph DSL using model-level input/output dtypes that match golden_manifest.json.",
+        "Write full_correctness_report.json with relative error, max error, compared files, and command evidence.",
+        "Do not begin performance-only rewrites in this stage."
+      ],
+      "quality_checks": [
+        "Every partition in the plan must be covered or explicitly reported as unsupported.",
+        "Full-model correctness must be checked against torch-generated full-model output.",
+        "The integrated DSL must be the artifact that 07_perf will optimize."
+      ],
+      "judge_checklist": [
+        "target_model_dsl.py covers all accepted partitions and preserves the SWFT execution chain.",
+        "full_correctness_report.json proves full-model DSL output vs torch-generated full-model output passed the final tolerance.",
+        "No partition is silently skipped.",
+        "The output is ready for formal interface packaging in 07_perf."
       ],
       "required_outputs": [
         "output/target_model_dsl.py",
@@ -198,7 +354,7 @@
       "id": "07_perf",
       "name": "Latency optimization",
       "agent_role": "Performance optimization agent",
-      "objective": "Optimize the already-correct DSL until latency is within target while preserving the required fp16-vs-fp32 accuracy bound.",
+      "objective": "Optimize the already-correct DSL until latency is within target while preserving the required final accuracy bound. Final latency must be measured through the formal interface path, not only through Python exec_kernel profiling.",
       "input_refs": [
         "stage:01_torch_export/output/model_ir.json",
         "stage:02_partition/output/partition_plan.json",
@@ -206,17 +362,43 @@
         "stage:06_dsl_integrate/output/target_model_dsl.py",
         "stage:06_dsl_integrate/output/full_correctness_report.json",
         "external:similar_model_dsl",
-        "external:swft_flow_doc"
+        "external:swft_flow_doc",
+        "external:swft_impl_notes",
+        "external:swft_perf_guide",
+        "external:swft_interface_flow"
       ],
       "allowed_edits": [
         "stages/07_perf/output/**",
         "stages/07_perf/logs/**",
         "target_dsl/**"
       ],
+      "procedure": [
+        "Read SWFT_PERF_GUIDE and SWFT_INTERFACE_FLOW before changing DSL.",
+        "Create a formal interface package from the correctness-passing DSL, generated .cce, input bins, golden bins, and host entry.",
+        "Measure baseline latency through the formal interface path.",
+        "Optimize tiling, fusion, core partitioning, memory layout, and GM traffic while preserving correctness.",
+        "After every meaningful optimization, rerun correctness against torch-generated full-model golden.",
+        "Write final target_model_dsl.py, interface_package, formal_run_report.json, perf_report.json, optimization_log.md, full_correctness_report.json, and validation_notes.md."
+      ],
+      "quality_checks": [
+        "Final reported latency must come from the formal interface path.",
+        "Correctness must remain within the configured tolerance after optimization.",
+        "The optimization log must explain each change and its measured impact.",
+        "If 200us is not reached, the report must identify the likely bottleneck and attempted optimizations."
+      ],
+      "judge_checklist": [
+        "formal_run_report.json proves non-Python interface execution was used.",
+        "perf_report.json includes baseline latency, final latency, measurement method, and whether latency_target_us was met.",
+        "full_correctness_report.json still passes after the final optimization.",
+        "optimization_log.md is specific enough to reproduce the tuning path."
+      ],
       "required_outputs": [
         "output/target_model_dsl.py",
+        "output/interface_package",
+        "output/formal_run_report.json",
         "output/perf_report.json",
         "output/optimization_log.md",
+        "output/full_correctness_report.json",
         "output/validation_notes.md"
       ],
       "validation_commands": []

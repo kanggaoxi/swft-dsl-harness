@@ -71,7 +71,7 @@ def save_state(workspace: Path, state: dict[str, Any]) -> None:
 def create_stage_dirs(workspace: Path, config: dict[str, Any]) -> None:
     for stage_id in stage_ids(config):
         base = workspace / "stages" / stage_id
-        for subdir in ("agent_package", "output", "logs", "validation"):
+        for subdir in ("agent_package", "judge_package", "output", "logs", "validation", "judge"):
             (base / subdir).mkdir(parents=True, exist_ok=True)
     (workspace / "shared" / "model").mkdir(parents=True, exist_ok=True)
     (workspace / "shared" / "similar_dsl").mkdir(parents=True, exist_ok=True)
@@ -92,7 +92,10 @@ def init_state(workspace: Path, config_path: Path, config: dict[str, Any]) -> di
                 "attempts": 0,
                 "package_path": None,
                 "last_validation_report": None,
-                "validated_at": None
+                "validated_at": None,
+                "last_judge_report": None,
+                "judged_at": None,
+                "judge_passed": None
             }
             for stage_id in ids
         }

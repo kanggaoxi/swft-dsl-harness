@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=None)
     parser.add_argument("--stage", default=DEFAULT_STAGE)
     parser.add_argument("--partitions", default=None, help="Comma-separated partition ids to package. Defaults to all.")
+    parser.add_argument("--ready-only", action="store_true", help="Package only partitions with no unresolved implementation dependencies.")
     parser.add_argument("--clean", action="store_true", help="Remove existing subagent package directory first.")
     return parser.parse_args()
 
@@ -66,8 +67,57 @@ def extract_partitions(plan: Any) -> list[dict[str, Any]]:
     return normalized
 
 
-def render_agent_task(partition: dict[str, Any], paths: dict[str, str], precision: dict[str, Any]) -> str:
+def listify(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def dependency_info(partition: dict[str, Any]) -> dict[str, Any]:
+    spec = partition["spec"]
+    semantic_deps = listify(spec.get("semantic_deps", spec.get("dependencies", spec.get("deps"))))
+    implementation_deps = listify(spec.get("implementation_deps", spec.get("impl_deps")))
+    fusion_group = spec.get("fusion_group")
+    independent = spec.get("can_implement_independently")
+    if independent is None:
+        independent = not implementation_deps
+    blocked_reasons = []
+    if implementation_deps:
+        blocked_reasons.append(f"implementation_deps={implementation_deps}")
+    if independent is False:
+        blocked_reasons.append("can_implement_independently=false")
+    return {
+        "semantic_deps": semantic_deps,
+        "implementation_deps": implementation_deps,
+        "fusion_group": fusion_group,
+        "can_implement_independently": bool(independent),
+        "ready": not blocked_reasons,
+        "blocked_reasons": blocked_reasons,
+    }
+
+
+def render_agent_task(partition: dict[str, Any], paths: dict[str, str], precision: dict[str, Any], dep_info: dict[str, Any]) -> str:
     partition_id = partition["id"]
+    if "weight_dtype_policy" in precision:
+        accuracy_lines = [
+            f"- weight dtype policy: `{precision.get('weight_dtype_policy', 'unspecified')}`",
+            f"- model input dtype policy: `{precision.get('model_input_dtype_policy', 'unspecified')}`",
+            f"- golden dtype policy: `{precision.get('golden_dtype_policy', 'unspecified')}`",
+            f"- DSL model IO dtype policy: `{precision.get('dsl_model_io_dtype_policy', 'unspecified')}`",
+            f"- final comparison: `{precision.get('final_comparison_metric', 'unspecified')}` <= `{precision.get('final_comparison_rtol', 'unspecified')}`",
+            f"- partition comparison default: `{precision.get('partition_comparison_metric', 'unspecified')}` <= `{precision.get('partition_comparison_default_rtol', 'unspecified')}`",
+            f"- partition documented override allowed: `{precision.get('partition_allow_documented_override', False)}`",
+        ]
+    else:
+        accuracy_lines = [
+            f"- model entry inputs and weights: `{precision.get('model_input_dtype', 'unspecified')}`",
+            f"- torch reference and golden outputs: `{precision.get('torch_reference_dtype', 'unspecified')}`",
+            f"- SWFT DSL runtime: `{precision.get('dsl_runtime_dtype', 'unspecified')}`",
+            f"- comparison metric: `{precision.get('comparison_metric', 'unspecified')}`",
+            f"- required tolerance: `{precision.get('comparison_rtol', 'unspecified')}`",
+        ]
     return "\n".join([
         f"# Subagent Task: Implement DSL for `{partition_id}`",
         "",
@@ -86,16 +136,23 @@ def render_agent_task(partition: dict[str, Any], paths: dict[str, str], precisio
         "Read these files from this package first:",
         "",
         "- `partition.json`: the only partition you own.",
-        "- `INPUT_MANIFEST.json`: shared paths for model IR, partition plan, golden manifest, cases, skeleton DSL, similar DSL, and SWFT flow docs.",
+        "- `INPUT_MANIFEST.json`: shared paths for model IR, partition plan, golden manifest, cases, skeleton DSL, similar DSL, SWFT flow docs, and implementation notes.",
         "- `OUTPUT_CONTRACT.json`: files this subagent must produce.",
+        "",
+        "## Dependency Status",
+        "",
+        f"- semantic deps: `{dep_info['semantic_deps']}`",
+        f"- implementation deps: `{dep_info['implementation_deps']}`",
+        f"- fusion group: `{dep_info['fusion_group']}`",
+        f"- can implement independently: `{dep_info['can_implement_independently']}`",
+        "",
+        "Semantic deps describe graph dataflow and do not block isolated partition development when torch-captured partition inputs are available.",
+        "Implementation deps describe layout, fusion, or shared code dependencies and should be resolved by the main agent before this package is assigned.",
+        "If `can implement independently` is false or implementation deps are non-empty, stop and report the blocked status unless the main agent explicitly assigned this package together with its dependency or fusion group.",
         "",
         "## Accuracy Target",
         "",
-        f"- model entry inputs and weights: `{precision.get('model_input_dtype', 'unspecified')}`",
-        f"- torch reference and golden outputs: `{precision.get('torch_reference_dtype', 'unspecified')}`",
-        f"- SWFT DSL runtime: `{precision.get('dsl_runtime_dtype', 'unspecified')}`",
-        f"- comparison metric: `{precision.get('comparison_metric', 'unspecified')}`",
-        f"- required tolerance: `{precision.get('comparison_rtol', 'unspecified')}`",
+        *accuracy_lines,
         "",
         "## Allowed Output Area",
         "",
@@ -104,11 +161,13 @@ def render_agent_task(partition: dict[str, Any], paths: dict[str, str], precisio
         "## Procedure",
         "",
         "1. Inspect `partition.json` for operation sequence, inputs, outputs, shapes, dtypes, and dependencies.",
-        "2. Reuse patterns from the similar DSL implementation where applicable.",
-        "3. Implement the partition in a partition-owned DSL file or patch fragment.",
-        "4. Compile and run only this partition's test case.",
-        "5. Compare actual output against the golden bins recorded in `golden_manifest.json`.",
-        "6. Write the required output contract files.",
+        "2. Read the SWFT flow docs and implementation notes from `INPUT_MANIFEST.json` before writing DSL.",
+        "3. Reuse patterns from the similar DSL implementation where applicable.",
+        "4. Implement the partition in this partition-owned file: `implementation.py`.",
+        "5. Use `slice_to_ub` for GM reads and `insert_to_gm` for GM writes unless you document a reason not to.",
+        "6. Compile and run only this partition's test case.",
+        "7. Compare actual output against the golden bins recorded in `golden_manifest.json`.",
+        "8. Write the required output contract files.",
         "",
         "## Completion Response",
         "",
@@ -140,6 +199,9 @@ def main() -> int:
         raise SystemExit(f"partition plan does not exist: {partition_plan_path}")
     partition_plan = load_json(partition_plan_path)
     partitions = extract_partitions(partition_plan)
+    dep_by_id = {item["id"]: dependency_info(item) for item in partitions}
+    ready_partitions = [item for item in partitions if dep_by_id[item["id"]]["ready"]]
+    blocked_partitions = [item for item in partitions if not dep_by_id[item["id"]]["ready"]]
 
     requested = None
     if args.partitions:
@@ -148,6 +210,8 @@ def main() -> int:
         missing = sorted(requested - {item["id"] for item in partitions})
         if missing:
             raise SystemExit(f"requested partitions not found: {', '.join(missing)}")
+    elif args.ready_only:
+        partitions = ready_partitions
 
     shared_inputs = []
     for ref in stage.get("input_refs", []):
@@ -165,9 +229,11 @@ def main() -> int:
         log_dir.mkdir(parents=True, exist_ok=True)
         base.mkdir(parents=True, exist_ok=True)
 
+        dep_info = dep_by_id[partition_id]
         save_json(base / "partition.json", {
             "id": partition_id,
             "index": partition["index"],
+            "dependency_info": dep_info,
             "spec": partition["spec"],
         })
         paths = {
@@ -181,6 +247,7 @@ def main() -> int:
             "workspace": str(workspace),
             "precision": config.get("precision", {}),
             "paths": paths,
+            "dependency_info": dep_info,
             "shared_inputs": shared_inputs,
         }
         output_contract = {
@@ -195,22 +262,44 @@ def main() -> int:
         save_json(base / "INPUT_MANIFEST.json", input_manifest)
         save_json(base / "OUTPUT_CONTRACT.json", output_contract)
         (base / "AGENT_TASK.md").write_text(
-            render_agent_task(partition, paths, config.get("precision", {})),
+            render_agent_task(partition, paths, config.get("precision", {}), dep_info),
             encoding="utf-8",
         )
         created.append({
             "partition_id": partition_id,
+            **dep_info,
             "package_path": str(base.resolve()),
             "output_dir": paths["output_dir"],
             "log_dir": paths["log_dir"],
+        })
+
+    blocked = []
+    for partition in blocked_partitions:
+        info = dep_by_id[partition["id"]]
+        blocked.append({
+            "partition_id": partition["id"],
+            "index": partition["index"],
+            **info,
         })
 
     manifest = {
         "stage": args.stage,
         "created_at": now_iso(),
         "package_dir": str(package_dir.resolve()),
+        "launch_mode": "manual_sessions",
+        "ready_only": args.ready_only,
         "partition_count": len(created),
+        "ready_partition_count": len([item for item in created if item["ready"]]),
+        "blocked_partition_count": len(blocked),
         "partitions": created,
+        "ready_partitions": [item for item in created if item["ready"]],
+        "blocked_partitions": blocked,
+        "manual_launch_instructions": [
+            "Open one fresh agent session per package_path that you want to run.",
+            "Give that agent only the package directory path and ask it to follow AGENT_TASK.md.",
+            "Do not let subagents edit shared target_dsl files or other partition output directories.",
+            "After subagents finish, the stage 05 main agent reviews their outputs and writes the aggregate manifests."
+        ],
     }
     manifest_path = stage_base / "output" / "subagent_task_manifest.json"
     save_json(manifest_path, manifest)

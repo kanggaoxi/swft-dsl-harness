@@ -4,7 +4,8 @@
 它走路线 B：以可信的 PyTorch 模型为唯一语义源，先由脚本/agent 导出并验证
 机器可读 IR，再基于 IR 切分子图，并直接用 PyTorch 捕获每个子图的 golden。
 这样后续 agent 不需要反复阅读完整 PyTorch 源码，也不依赖手写的文字版计算图。
-输入说明也不是手工预先准备的，`input_spec.json` 会由第 1 阶段根据模型代码和权重导出。
+输入说明也不是手工预先准备的，`input_spec.json` 会由第 1 阶段根据模型代码、
+权重和 `model_config.json` 导出。
 
 ## 流水线
 
@@ -33,11 +34,14 @@ python3 scripts/init_pipeline.py --workspace work
 ```text
 work/shared/model/model.py
 work/shared/model/weights.pth
+work/shared/model/model_config.json
 work/shared/similar_dsl/similar_model_dsl.py
 ```
 
-这里你只需要准备模型代码和权重。`input_spec.json` 会在 `01_torch_export`
-阶段生成，里面会记录模型入口输入的名字、shape、dtype 和构造方式。
+`model_config.json` 会在初始化时自动创建。你需要把里面的 `model_class` 改成
+目标模型类名，并按需填写 `model_kwargs`、`entry_method` 等字段。
+`input_spec.json` 会在 `01_torch_export` 阶段生成，里面会记录模型入口输入的名字、
+shape、dtype 和构造方式。
 
 为当前阶段生成任务包：
 
@@ -55,10 +59,12 @@ work/stages/01_torch_export/agent_package/
 
 ```bash
 python3 scripts/validate_stage.py --workspace work --stage 01_torch_export
+python3 scripts/package_judge.py --workspace work --stage 01_torch_export
+python3 scripts/validate_judge.py --workspace work --stage 01_torch_export
 python3 scripts/advance_stage.py --workspace work
 ```
 
-每个阶段都按这个顺序循环：打包 -> agent 工作 -> 验证 -> 推进。
+每个阶段都按这个顺序循环：打包 -> 人手动开启 agent 会话并交付任务包 -> agent 工作 -> 机械验证 -> 独立 judge -> 推进。
 
 ## 任务包是怎么生成的
 
@@ -81,6 +87,8 @@ input_refs         这个阶段允许读取哪些输入
 allowed_edits      这个阶段允许修改哪些路径
 required_outputs   这个阶段必须产出哪些文件
 validation_commands 额外的机器校验命令
+procedure           本阶段 agent 应执行的步骤
+quality_checks      agent 交付前自检项
 ```
 
 生成的任务包固定包含：
@@ -92,10 +100,16 @@ OUTPUT_CONTRACT.json 本阶段必须产出的文件清单
 VALIDATION.md        本阶段验收方式
 ```
 
+`AGENT_TASK.md` 会把当前阶段的目标、输入路径、操作步骤、自检项和验收流程写进去。
+目标是让阶段 agent 拿到任务包后不需要人再额外补 prompt。
+
+`judge_checklist` 不会写入 worker 的 `AGENT_TASK.md`。它只会进入 judge package，
+避免 worker agent 围绕 judge 检查项做表面满足。
+
 因此，真正控制每个阶段行为的是 `configs/pipeline.default.json`，
 不是一堆手写的独立 prompt。
 
-## 验证失败怎么处理
+## 机械验证和 Judge
 
 执行验证：
 
@@ -103,7 +117,7 @@ VALIDATION.md        本阶段验收方式
 python3 scripts/validate_stage.py --workspace work --stage <stage_id>
 ```
 
-验证程序会检查两类内容：
+机械验证程序会检查两类内容：
 
 1. `required_outputs` 声明的文件或目录是否存在。
 2. `validation_commands` 声明的命令是否成功返回。
@@ -114,12 +128,39 @@ python3 scripts/validate_stage.py --workspace work --stage <stage_id>
 work/stages/<stage_id>/validation/VALIDATION_REPORT.json
 ```
 
-失败后不要执行 `advance_stage.py`。正确处理方式是：
+机械验证通过后，还要创建独立 judge 任务包：
+
+```bash
+python3 scripts/package_judge.py --workspace work --stage <stage_id>
+```
+
+把下面目录交给一个没有继承干活 agent 上下文的新 judge agent：
+
+```text
+work/stages/<stage_id>/judge_package/
+```
+
+judge agent 必须写出：
+
+```text
+work/stages/<stage_id>/judge/JUDGE_REPORT.json
+```
+
+然后执行：
+
+```bash
+python3 scripts/validate_judge.py --workspace work --stage <stage_id>
+```
+
+只有机械验证和 judge 都通过后，`advance_stage.py` 才会允许进入下一阶段。
+
+如果任一验证失败，不要执行 `advance_stage.py`。正确处理方式是：
 
 1. 打开 `VALIDATION_REPORT.json`，确认缺少什么或哪个命令失败。
 2. 把失败报告交给当前阶段 agent，让它只修当前阶段允许修改的文件。
-3. 修完后再次执行 `validate_stage.py`。
-4. 只有验证通过后，才执行：
+3. 如果是 judge 失败，把 `JUDGE_REPORT.json` 交给当前阶段 agent 修复。
+4. 修完后再次执行 `validate_stage.py`、`package_judge.py` 和 `validate_judge.py`。
+5. 只有两道门都通过后，才执行：
 
 ```bash
 python3 scripts/advance_stage.py --workspace work
@@ -137,10 +178,37 @@ partition 的独立任务包：
 python3 scripts/package_dsl_subagents.py --workspace work --clean
 ```
 
+如果只想打包当前可以独立实现的 partition：
+
+```bash
+python3 scripts/package_dsl_subagents.py --workspace work --clean --ready-only
+```
+
 生成结果位于：
 
 ```text
 work/stages/05_dsl_partitions/subagent_packages/<partition_id>/
+```
+
+同时会生成：
+
+```text
+work/stages/05_dsl_partitions/output/subagent_task_manifest.json
+```
+
+这个 manifest 会列出：
+
+```text
+ready_partitions    可以手动开新会话并行发出去的任务
+blocked_partitions  因 implementation_deps 或 can_implement_independently=false 暂不应单独发出去的任务
+package_path        每个 subagent 任务包目录
+```
+
+这里的依赖分两类：
+
+```text
+semantic_deps        图语义依赖；如果 torch 已捕获该 partition 输入，通常不阻塞独立开发
+implementation_deps 实现依赖；表示 layout、融合、共享代码等未定，应该等待或合并给同一个 subagent
 ```
 
 每个 subagent 只读取自己包里的 `partition.json`、`INPUT_MANIFEST.json` 和
@@ -149,6 +217,10 @@ work/stages/05_dsl_partitions/subagent_packages/<partition_id>/
 ```text
 work/stages/05_dsl_partitions/output/partitions/<partition_id>/
 ```
+
+推荐人工启动方式是：每个 `package_path` 开一个全新 agent 会话，把目录路径交给它，
+要求它阅读并执行 `AGENT_TASK.md`。不要让 subagent 修改公共 `target_dsl/` 或其他
+partition 的输出目录。
 
 主 agent 收集通过验证的子图实现后，再写出：
 
@@ -167,9 +239,11 @@ work/stages/05_dsl_partitions/output/partition_correctness_report.json
 ```text
 work/stages/<stage_id>/
   agent_package/
+  judge_package/
   output/
   logs/
   validation/
+  judge/
 ```
 
 agent 应该只修改 `AGENT_TASK.md` 允许的文件。验证门会检查必需产物，
@@ -181,6 +255,6 @@ agent 应该只修改 `AGENT_TASK.md` 允许的文件。验证门会检查必需
 
 ## 重要说明
 
-这个 harness 本身不负责调用 LLM。它只是流程控制器：
+这个 harness 本身不负责调用 LLM，也不自动拉起 agent。它只是流程控制器：
 负责打包任务、记录状态、验证输出、推进流水线。
 只要你的 agent 能读取任务包并写出契约规定的文件，就可以接入这套流程。

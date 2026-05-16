@@ -9,13 +9,19 @@ captured directly from PyTorch. DSL agents should consume those validated
 artifacts and should not re-derive model semantics from the full PyTorch
 source unless a validation report explicitly asks for that.
 
-Precision contract:
+Precision and dtype contract:
 
-- model weights and model entry inputs are fp32
-- torch reference outputs and golden bins are fp32
-- SWFT DSL implementation runs in fp16
-- final comparison against torch fp32 outputs must satisfy relative error
-  `<= 4e-5`
+- weight dtypes follow the tensors stored in the `.pth` checkpoint; do not
+  silently force weights to fp32
+- model entry input dtypes come from `input_spec.json`
+- golden bins are produced by the PyTorch model runtime following checkpoint
+  dtypes and `input_spec.json`
+- from the full-model perspective, DSL model input and output dtypes must match
+  the golden model input and output dtypes
+- final full-model output relative error must satisfy the configured
+  `final_comparison_rtol`
+- partition comparisons use the configured default tolerance, but documented
+  local overrides are allowed; final full-model accuracy is the hard gate
 
 ## Repository Areas
 
@@ -32,7 +38,7 @@ Precision contract:
 The standard `op_test/math/tanh.py` flow is:
 
 1. Generate input and golden output bins.
-2. Build Tensor placeholders.
+2. Build GM Tensor placeholders.
 3. Call the `@sub_kernel` function to record DSL trace.
 4. Call `compile_kernel(...)` to generate `<op>.cce`.
 5. Call `exec_kernel(...)` to generate `main.cpp`.
@@ -42,6 +48,32 @@ The standard `op_test/math/tanh.py` flow is:
 
 `compile_kernel` does not execute the NPU kernel. It emits CCE source.
 `exec_kernel` is the step that builds and runs the generated test executable.
+
+## GM Tensors and exec_kernel
+
+GM Tensors connect kernel parameters with `exec_kernel(inputs=..., outputs=...)`:
+
+- the kernel function must access inputs, weights, and outputs through GM Tensor parameters
+- `inputs` and `outputs` contain GM Tensor variable names
+- those variable names must exist in the `locals()` passed to `exec_kernel`
+- before `exec_kernel`, the DSL should already have called `compile_kernel` and the kernel function should have been called to record trace
+
+Recommended order:
+
+```text
+define GM Tensors
+define @sub_kernel function
+compile_kernel(...)
+call the kernel function to record trace
+exec_kernel(...)
+```
+
+## Formal Performance Path
+
+`exec_kernel` is the correctness path. Performance work should not rely only on
+Python-side profiling. After full correctness passes, stage `07_perf` should
+move the generated `.cce`, input/output data, and host entry into the formal
+interface path, then build and run it outside Python to collect latency.
 
 ## Development Rule
 

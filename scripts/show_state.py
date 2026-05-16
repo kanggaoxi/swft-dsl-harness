@@ -21,7 +21,9 @@ def main() -> int:
     print(f"workspace: {state['workspace']}")
     print(f"current_stage: {state['current_stage']}")
     for stage_id, info in state["stages"].items():
-        print(f"{stage_id}: {info['status']}")
+        judge = info.get("judge_passed")
+        judge_text = "unknown" if judge is None else str(judge).lower()
+        print(f"{stage_id}: {info['status']} judge={judge_text}")
     return 0
 
 

@@ -25,6 +25,11 @@ def main() -> int:
     current = state["current_stage"]
     if state["stages"][current]["status"] != "passed":
         raise SystemExit(f"current stage {current} is not passed")
+    if config.get("judge", {}).get("enabled", True) and state["stages"][current].get("judge_passed") is not True:
+        raise SystemExit(
+            f"current stage {current} has not passed independent judge; "
+            f"run scripts/package_judge.py and scripts/validate_judge.py first"
+        )
 
     nxt = next_stage_id(config, current)
     if not nxt:
