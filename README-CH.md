@@ -29,7 +29,7 @@ agent 之间不直接对话。编排器只把已经验证通过的文件传给�
 python3 scripts/init_pipeline.py --workspace work
 ```
 
-把用户提供的输入放到下面这些位置：
+初始化会创建 `work/input_paths.json`。默认情况下，用户提供的输入路径是：
 
 ```text
 work/shared/model/model.py
@@ -38,10 +38,33 @@ work/shared/model/model_config.json
 work/shared/similar_dsl/similar_model_dsl.py
 ```
 
+如果你的文件名不同，不需要改 harness 代码。把文件放在工作区里，然后修改
+`work/input_paths.json`，例如：
+
+```json
+{
+  "torch_model_source": "shared/model/my_model_impl.py",
+  "torch_model_config": "shared/model/model_config.json",
+  "torch_weights": "shared/model/checkpoint_epoch_20.pth",
+  "similar_model_dsl": "shared/similar_dsl/corr_model_dsl_v3.py"
+}
+```
+
+路径可以是相对 `work/` 的相对路径，也可以是绝对路径。打包阶段任务时，
+`INPUT_MANIFEST.json` 和 `JUDGE_INPUT_MANIFEST.json` 会写入解析后的真实路径。
+
 `model_config.json` 会在初始化时自动创建。你需要把里面的 `model_class` 改成
 目标模型类名，并按需填写 `model_kwargs`、`entry_method` 等字段。
+权重文件路径以 `input_paths.json` 里的 `torch_weights` 为准，不需要写死到
+`model_config.json` 里。
 `input_spec.json` 会在 `01_torch_export` 阶段生成，里面会记录模型入口输入的名字、
 shape、dtype 和构造方式。
+
+打包前可以先检查输入路径：
+
+```bash
+python3 scripts/check_inputs.py --workspace work --stage 01_torch_export
+```
 
 为当前阶段生成任务包：
 

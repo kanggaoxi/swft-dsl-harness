@@ -38,6 +38,20 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
     return load_json(config_path or DEFAULT_CONFIG)
 
 
+def input_paths_path(workspace: Path) -> Path:
+    return workspace / "input_paths.json"
+
+
+def load_input_paths(workspace: Path) -> dict[str, Any]:
+    path = input_paths_path(workspace)
+    if not path.exists():
+        return {}
+    data = load_json(path)
+    if not isinstance(data, dict):
+        raise TypeError(f"input paths must be a JSON object: {path}")
+    return data
+
+
 def stage_by_id(config: dict[str, Any], stage_id: str) -> dict[str, Any]:
     for stage in config["stages"]:
         if stage["id"] == stage_id:
@@ -109,9 +123,39 @@ def stage_dir(workspace: Path, stage_id: str) -> Path:
 def resolve_external(config: dict[str, Any], label: str, workspace: Path) -> dict[str, Any]:
     for item in config.get("external_inputs", []):
         if item["label"] == label:
-            base = HARNESS_ROOT if item.get("relative_to") == "harness" else workspace
-            resolved = (base / item["path"]).resolve()
-            return {**item, "resolved_path": str(resolved)}
+            default_relative_to = item.get("relative_to", "workspace")
+            relative_to = default_relative_to
+            configured_path = item["path"]
+            source = "pipeline_config"
+
+            overrides = load_input_paths(workspace)
+            if label in overrides:
+                override = overrides[label]
+                source = "input_paths.json"
+                if isinstance(override, str):
+                    configured_path = override
+                    relative_to = "workspace"
+                elif isinstance(override, dict):
+                    configured_path = override.get("path", item["path"])
+                    relative_to = override.get("relative_to", "workspace")
+                else:
+                    raise TypeError(f"input path override for {label} must be a string or object")
+
+            path = Path(configured_path)
+            if path.is_absolute():
+                resolved = path.resolve()
+            else:
+                base = HARNESS_ROOT if relative_to == "harness" else workspace
+                resolved = (base / path).resolve()
+            return {
+                **item,
+                "path": configured_path,
+                "default_path": item["path"],
+                "relative_to": relative_to,
+                "default_relative_to": default_relative_to,
+                "path_source": source,
+                "resolved_path": str(resolved),
+            }
     raise KeyError(f"unknown external input: {label}")
 
 
@@ -125,7 +169,11 @@ def resolve_input_ref(config: dict[str, Any], ref: str, workspace: Path) -> dict
             "label": label,
             "kind": "external",
             "path": str(path),
-            "exists": path.exists()
+            "exists": path.exists(),
+            "path_source": item.get("path_source"),
+            "configured_path": item.get("path"),
+            "default_path": item.get("default_path"),
+            "relative_to": item.get("relative_to"),
         }
     if ref.startswith("stage:"):
         payload = ref.split(":", 1)[1]

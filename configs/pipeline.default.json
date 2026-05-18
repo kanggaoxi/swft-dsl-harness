@@ -83,16 +83,16 @@
         "stages/01_torch_export/logs/**"
       ],
       "procedure": [
-        "Read model_config.json first. Treat model_class, model_kwargs, entry_method, and state_dict_path as the authoritative model entry configuration.",
-        "Load model.py, instantiate the configured class with model_kwargs, load weights.pth, switch to eval mode, and disable gradients.",
+        "Read model_config.json first. Treat model_class, model_kwargs, and entry_method as the authoritative model entry configuration. Treat the INPUT_MANIFEST torch_weights path as the authoritative weight file.",
+        "Load the torch_model_source and torch_weights paths from INPUT_MANIFEST.json, instantiate the configured class with model_kwargs, switch to eval mode, and disable gradients.",
         "Infer model entry inputs and write input_spec.json with names, shapes, dtypes, construction method, and reproducibility seed.",
         "Export model_ir.json, node_manifest.json, and weight_map.json from the trusted PyTorch execution path.",
-        "Write torch_runner.py so downstream stages can run the model and capture intermediates without rereading full model.py.",
+        "Write torch_runner.py so downstream stages can run the model and capture intermediates without rereading the full torch_model_source file.",
         "Run validation that compares the exported runner and IR assumptions against the original PyTorch model, then write export_validation_report.json."
       ],
       "quality_checks": [
         "Do not ask the user for input_spec.json; this stage owns generating it.",
-        "Do not hard-code a class name from model.py if model_config.json provides one.",
+        "Do not hard-code a class name from the model source if model_config.json provides one.",
         "Record every checkpoint tensor's dtype and shape in weight_map.json; do not silently cast weights to fp32.",
         "input_spec.json must explicitly define model entry input dtype, shape, seed, and construction method.",
         "The exported runner must be deterministic and usable by later stages."
