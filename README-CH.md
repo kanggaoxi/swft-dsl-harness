@@ -36,6 +36,7 @@ work/shared/model/model.py
 work/shared/model/weights.pth
 work/shared/model/model_config.json
 work/shared/similar_dsl/similar_model_dsl.py
+<harness_repo>/swft_source/   可选，SWFT 编译器源码目录
 ```
 
 如果你的文件名不同，不需要改 harness 代码。把文件放在工作区里，然后修改
@@ -46,7 +47,11 @@ work/shared/similar_dsl/similar_model_dsl.py
   "torch_model_source": "shared/model/my_model_impl.py",
   "torch_model_config": "shared/model/model_config.json",
   "torch_weights": "shared/model/checkpoint_epoch_20.pth",
-  "similar_model_dsl": "shared/similar_dsl/corr_model_dsl_v3.py"
+  "similar_model_dsl": "shared/similar_dsl/corr_model_dsl_v3.py",
+  "swft_source": {
+    "path": "swft_source",
+    "relative_to": "harness"
+  }
 }
 ```
 
@@ -59,6 +64,11 @@ work/shared/similar_dsl/similar_model_dsl.py
 `model_config.json` 里。
 `input_spec.json` 会在 `01_torch_export` 阶段生成，里面会记录模型入口输入的名字、
 shape、dtype 和构造方式。
+
+`swft_source` 是可选输入。如果你已经拿到 SWFT 编译器源码，建议放到 harness 仓库根目录的
+`swft_source/`，或者在 `input_paths.json` 里把 `swft_source` 改成实际路径。
+后续 DSL 开发和 debug 阶段会把它作为可读输入注入任务包，但 agent 应该只做定向检索，
+不要把整个编译器源码读进上下文。
 
 打包前可以先检查输入路径：
 
@@ -212,7 +222,49 @@ python3 scripts/package_dsl_subagents.py --workspace work --clean --ready-only
 存在 implementation_deps 的 partition 和它依赖的 partition 放进同一个 bundle
 can_implement_independently=false 的 partition 尽量和依赖或融合组放在一起，否则标记为 blocked
 相邻、很小、无实现依赖的 elementwise partition 会合并，默认每包最多 4 个
+repeat_group 用于完全重复结构：先实现 prototype，再按 per-instance 绑定适配 replica
+similarity_group 用于相似但不完全相同结构：复用 shared_core，只实现 variant_delta
 semantic_deps 不阻塞并行开发，因为 03 阶段已经捕获了每个 partition 的 torch 输入
+```
+
+`02_partition` 阶段可以在 `partition_plan.json` 里写这些字段来指导 05 阶段：
+
+```json
+{
+  "id": "layer0_block",
+  "repeat_group": "transformer_block",
+  "repeat_index": 0,
+  "repeat_role": "prototype",
+  "implementation_signature": "encoder_block_v1"
+}
+```
+
+后续重复层可以写：
+
+```json
+{
+  "id": "layer1_block",
+  "repeat_group": "transformer_block",
+  "repeat_index": 1,
+  "repeat_role": "replica",
+  "implementation_signature": "encoder_block_v1",
+  "prototype_ref": "layer0_block"
+}
+```
+
+如果两个子图只是相似，不应该假装成重复层，而应写：
+
+```json
+{
+  "id": "variant_a",
+  "similarity_group": "attention_family",
+  "implementation_signature": "attention_core_v1",
+  "shared_core": ["qkv_matmul", "scale", "softmax"],
+  "variant_delta": {
+    "residual": "pre_norm",
+    "mask": "causal"
+  }
+}
 ```
 
 可以用下面参数关闭小 elementwise 合包，或调整最大合包数量：
@@ -251,6 +303,8 @@ ready_bundles       可以手动开新 work agent 会话并行发出去的 bundl
 blocked_bundles     因实现依赖未解决而暂不应单独发出去的 bundle
 work_package_path   给 work agent 的任务包
 judge_package_path  给 judge agent 的任务包
+repeat_groups       重复结构的 prototype/replica 信息
+similarity_groups   相似结构的 shared_core/variant_delta 信息
 ```
 
 这里的依赖分两类：

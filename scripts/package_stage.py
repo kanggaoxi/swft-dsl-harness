@@ -96,13 +96,22 @@ def render_task(stage: dict, input_manifest: dict, output_contract: dict, valida
         "Read `INPUT_MANIFEST.json` first. It lists the exact files available to this stage.",
         "",
     ])
-    missing = [item for item in input_manifest["inputs"] if not item["exists"]]
+    missing = [item for item in input_manifest["inputs"] if not item["exists"] and not item.get("optional", False)]
     if missing:
         lines.extend([
-            "The following declared inputs are currently missing. If they are required for your task, stop and report the missing paths:",
+            "The following required inputs are currently missing. Stop and report the missing paths:",
             "",
         ])
         for item in missing:
+            lines.append(f"- `{item['label']}`: `{item['path']}`")
+        lines.append("")
+    optional_missing = [item for item in input_manifest["inputs"] if not item["exists"] and item.get("optional", False)]
+    if optional_missing:
+        lines.extend([
+            "The following optional inputs are not available. Continue without them unless your task specifically needs them:",
+            "",
+        ])
+        for item in optional_missing:
             lines.append(f"- `{item['label']}`: `{item['path']}`")
         lines.append("")
     existing = [item for item in input_manifest["inputs"] if item["exists"]]

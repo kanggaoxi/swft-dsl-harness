@@ -118,6 +118,14 @@ def dependency_info(partition: dict[str, Any]) -> dict[str, Any]:
     semantic_deps = listify(spec.get("semantic_deps", spec.get("dependencies", spec.get("deps"))))
     implementation_deps = listify(spec.get("implementation_deps", spec.get("impl_deps")))
     fusion_group = spec.get("fusion_group")
+    repeat_group = spec.get("repeat_group")
+    repeat_index = spec.get("repeat_index")
+    repeat_role = spec.get("repeat_role")
+    implementation_signature = spec.get("implementation_signature")
+    prototype_ref = spec.get("prototype_ref")
+    similarity_group = spec.get("similarity_group")
+    shared_core = listify(spec.get("shared_core"))
+    variant_delta = spec.get("variant_delta", {})
     independent = spec.get("can_implement_independently")
     if independent is None:
         independent = not implementation_deps
@@ -130,6 +138,14 @@ def dependency_info(partition: dict[str, Any]) -> dict[str, Any]:
         "semantic_deps": semantic_deps,
         "implementation_deps": implementation_deps,
         "fusion_group": fusion_group,
+        "repeat_group": repeat_group,
+        "repeat_index": repeat_index,
+        "repeat_role": repeat_role,
+        "implementation_signature": implementation_signature,
+        "prototype_ref": prototype_ref,
+        "similarity_group": similarity_group,
+        "shared_core": shared_core,
+        "variant_delta": variant_delta,
         "can_implement_independently": bool(independent),
         "partition_level_ready": not blocked_reasons,
         "blocked_reasons": blocked_reasons,
@@ -175,6 +191,7 @@ def forced_partition_groups(partitions: list[dict[str, Any]], dep_by_id: dict[st
     id_set = set(ids)
     dsu = DisjointSet(ids)
     by_fusion_group: dict[str, list[str]] = {}
+    by_signature: dict[str, list[str]] = {}
 
     for partition in partitions:
         partition_id = partition["id"]
@@ -182,6 +199,10 @@ def forced_partition_groups(partitions: list[dict[str, Any]], dep_by_id: dict[st
         fusion_group = info.get("fusion_group")
         if fusion_group not in (None, ""):
             by_fusion_group.setdefault(str(fusion_group), []).append(partition_id)
+        signature = info.get("implementation_signature")
+        similarity_group = info.get("similarity_group")
+        if similarity_group not in (None, "") and signature not in (None, ""):
+            by_signature.setdefault(f"similar:{similarity_group}:{signature}", []).append(partition_id)
         for dep in info["implementation_deps"]:
             if dep in id_set:
                 dsu.union(partition_id, dep)
@@ -191,6 +212,10 @@ def forced_partition_groups(partitions: list[dict[str, Any]], dep_by_id: dict[st
                     dsu.union(partition_id, dep)
 
     for group_ids in by_fusion_group.values():
+        head = group_ids[0]
+        for partition_id in group_ids[1:]:
+            dsu.union(head, partition_id)
+    for group_ids in by_signature.values():
         head = group_ids[0]
         for partition_id in group_ids[1:]:
             dsu.union(head, partition_id)
@@ -215,6 +240,13 @@ def bundle_status(bundle_partitions: list[dict[str, Any]], dep_by_id: dict[str, 
     semantic_deps = []
     implementation_deps = []
     fusion_groups = []
+    repeat_groups = []
+    repeat_roles = []
+    implementation_signatures = []
+    similarity_groups = []
+    shared_cores = []
+    variant_deltas = {}
+    prototype_refs = []
     small_elementwise = []
     for partition in bundle_partitions:
         partition_id = partition["id"]
@@ -223,6 +255,19 @@ def bundle_status(bundle_partitions: list[dict[str, Any]], dep_by_id: dict[str, 
         implementation_deps.extend(info["implementation_deps"])
         if info["fusion_group"] not in (None, ""):
             fusion_groups.append(str(info["fusion_group"]))
+        if info["repeat_group"] not in (None, ""):
+            repeat_groups.append(str(info["repeat_group"]))
+        if info["repeat_role"] not in (None, ""):
+            repeat_roles.append(str(info["repeat_role"]))
+        if info["implementation_signature"] not in (None, ""):
+            implementation_signatures.append(str(info["implementation_signature"]))
+        if info["similarity_group"] not in (None, ""):
+            similarity_groups.append(str(info["similarity_group"]))
+        shared_cores.extend(info["shared_core"])
+        if info["variant_delta"] not in (None, {}, []):
+            variant_deltas[partition_id] = info["variant_delta"]
+        if info["prototype_ref"] not in (None, ""):
+            prototype_refs.append(str(info["prototype_ref"]))
         if is_small_elementwise(partition, info):
             small_elementwise.append(partition_id)
         for dep in info["implementation_deps"]:
@@ -239,8 +284,84 @@ def bundle_status(bundle_partitions: list[dict[str, Any]], dep_by_id: dict[str, 
         "semantic_deps": sorted(set(semantic_deps)),
         "implementation_deps": sorted(set(implementation_deps)),
         "fusion_groups": sorted(set(fusion_groups)),
+        "repeat_groups": sorted(set(repeat_groups)),
+        "repeat_roles": sorted(set(repeat_roles)),
+        "implementation_signatures": sorted(set(implementation_signatures)),
+        "similarity_groups": sorted(set(similarity_groups)),
+        "shared_core": sorted(set(shared_cores)),
+        "variant_deltas": variant_deltas,
+        "prototype_refs": sorted(set(prototype_refs)),
         "small_elementwise_partitions": small_elementwise,
     }
+
+
+def build_repeat_group_manifest(partitions: list[dict[str, Any]], dep_by_id: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for partition in partitions:
+        repeat_group = dep_by_id[partition["id"]].get("repeat_group")
+        if repeat_group not in (None, ""):
+            grouped.setdefault(str(repeat_group), []).append(partition)
+
+    manifests = []
+    for group_name, group_partitions in sorted(grouped.items()):
+        entries = []
+        prototypes = []
+        replicas = []
+        for partition in sorted(group_partitions, key=lambda item: item["index"]):
+            info = dep_by_id[partition["id"]]
+            entry = {
+                "partition_id": partition["id"],
+                "repeat_index": info.get("repeat_index"),
+                "repeat_role": info.get("repeat_role"),
+                "implementation_signature": info.get("implementation_signature"),
+                "prototype_ref": info.get("prototype_ref"),
+            }
+            entries.append(entry)
+            if info.get("repeat_role") == "prototype":
+                prototypes.append(partition["id"])
+            elif info.get("repeat_role") == "replica":
+                replicas.append(partition["id"])
+        manifests.append({
+            "repeat_group": group_name,
+            "prototype_partitions": prototypes,
+            "replica_partitions": replicas,
+            "partitions": entries,
+            "policy": "implement prototype partitions first; implement replicas by adapting the prototype with per-instance bindings and verify every replica against its own torch golden",
+        })
+    return manifests
+
+
+def build_similarity_group_manifest(partitions: list[dict[str, Any]], dep_by_id: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for partition in partitions:
+        similarity_group = dep_by_id[partition["id"]].get("similarity_group")
+        if similarity_group not in (None, ""):
+            grouped.setdefault(str(similarity_group), []).append(partition)
+
+    manifests = []
+    for group_name, group_partitions in sorted(grouped.items()):
+        entries = []
+        shared_core = []
+        signatures = []
+        for partition in sorted(group_partitions, key=lambda item: item["index"]):
+            info = dep_by_id[partition["id"]]
+            shared_core.extend(info.get("shared_core", []))
+            if info.get("implementation_signature") not in (None, ""):
+                signatures.append(str(info["implementation_signature"]))
+            entries.append({
+                "partition_id": partition["id"],
+                "implementation_signature": info.get("implementation_signature"),
+                "shared_core": info.get("shared_core", []),
+                "variant_delta": info.get("variant_delta", {}),
+            })
+        manifests.append({
+            "similarity_group": group_name,
+            "implementation_signatures": sorted(set(signatures)),
+            "shared_core": sorted(set(shared_core)),
+            "variants": entries,
+            "policy": "reuse the shared core where possible, implement only documented variant_delta differences, and verify every variant against its own torch golden",
+        })
+    return manifests
 
 
 def make_bundles(
@@ -281,7 +402,12 @@ def make_bundles(
     bundles = []
     for idx, group in enumerate(raw_bundles):
         status = bundle_status(group, dep_by_id, id_set)
-        reason = "small_adjacent_elementwise" if len(group) > 1 and status["small_elementwise_partitions"] else "forced_dependency_or_single_partition"
+        if len(group) > 1 and status["similarity_groups"]:
+            reason = "similarity_group"
+        elif len(group) > 1 and status["small_elementwise_partitions"]:
+            reason = "small_adjacent_elementwise"
+        else:
+            reason = "forced_dependency_or_single_partition"
         bundle_id = bundle_id_for(group, idx)
         bundles.append({
             "bundle_id": bundle_id,
@@ -345,11 +471,24 @@ def render_work_task(bundle: dict[str, Any], paths: dict[str, str], precision: d
         f"- semantic deps: `{bundle['semantic_deps']}`",
         f"- implementation deps: `{bundle['implementation_deps']}`",
         f"- fusion groups: `{bundle['fusion_groups']}`",
+        f"- repeat groups: `{bundle['repeat_groups']}`",
+        f"- repeat roles: `{bundle['repeat_roles']}`",
+        f"- implementation signatures: `{bundle['implementation_signatures']}`",
+        f"- similarity groups: `{bundle['similarity_groups']}`",
+        f"- shared core: `{bundle['shared_core']}`",
+        f"- variant deltas: `{bundle['variant_deltas']}`",
+        f"- prototype refs: `{bundle['prototype_refs']}`",
         f"- blocked reasons: `{bundle['blocked_reasons']}`",
         "",
         "Semantic deps describe graph dataflow and do not block isolated bundle development when torch-captured partition inputs are available.",
         "Implementation deps describe layout, fusion, or shared code dependencies. This bundle was built to keep implementation-coupled partitions together.",
+        "Repeat groups describe structurally identical instances. Implement prototype partitions first, then adapt replicas with per-instance bindings and verify every instance.",
+        "Similarity groups describe related but not identical variants. Reuse the shared core where possible and implement only the documented variant deltas.",
         "If `ready` is false, stop and report the blocked status unless the main agent explicitly assigned this package with additional context.",
+        "",
+        "## Optional SWFT Source",
+        "",
+        "If `INPUT_MANIFEST.json` contains `swft_source`, use it when DSL semantics, generated CCE, or runtime behavior are unclear. Prefer targeted source searches over reading the whole compiler tree.",
         "",
         "## Accuracy Target",
         "",
@@ -368,7 +507,8 @@ def render_work_task(bundle: dict[str, Any], paths: dict[str, str], precision: d
         "5. Use `slice_to_ub` for GM reads and `insert_to_gm` for GM writes unless you document a reason not to.",
         "6. Compile and run only this bundle's partition test cases.",
         "7. Compare actual outputs against the golden bins recorded in `golden_manifest.json`.",
-        "8. Write every required output contract file, including bundle-level summary reports.",
+        "8. When debugging a DSL compile/runtime mismatch, inspect SWFT source only for the relevant frontend/API/lowering path and record the files consulted.",
+        "9. Write every required output contract file, including bundle-level summary reports.",
         "",
         "## Completion Response",
         "",
@@ -411,7 +551,10 @@ def render_judge_task(bundle: dict[str, Any], manifest: dict[str, Any], precisio
         "4. Confirm correctness reports compare DSL actuals against torch-generated golden bins.",
         "5. Confirm relative error satisfies the configured partition tolerance, or that any override is explicit and justified.",
         "6. Confirm no shared target_dsl files, upstream stage outputs, golden files, or other bundle output directories were modified by this bundle work.",
-        "7. Confirm blocked bundles were not passed unless the work output documents the missing dependency resolution.",
+        "7. For repeat groups, confirm replicas are adapted from the prototype with correct per-instance weights/inputs/outputs and each replica has its own golden comparison.",
+        "8. For similarity groups, confirm the shared core is reused where appropriate and each variant_delta is explicitly implemented and tested.",
+        "9. Confirm any SWFT source conclusions cite specific files or code paths, not vague compiler assumptions.",
+        "10. Confirm blocked bundles were not passed unless the work output documents the missing dependency resolution.",
         "",
         "## Required Report",
         "",
@@ -462,6 +605,7 @@ def main() -> int:
     partition_plan = load_json(partition_plan_path)
     partitions = extract_partitions(partition_plan)
     dep_by_id = {item["id"]: dependency_info(item) for item in partitions}
+    all_partitions = partitions
 
     requested = None
     if args.partitions:
@@ -484,6 +628,9 @@ def main() -> int:
     shared_inputs = []
     for ref in stage.get("input_refs", []):
         shared_inputs.append(resolve_input_ref(config, ref, workspace))
+
+    repeat_group_manifest = build_repeat_group_manifest(all_partitions, dep_by_id)
+    similarity_group_manifest = build_similarity_group_manifest(all_partitions, dep_by_id)
 
     created = []
     for bundle in bundles:
@@ -543,6 +690,13 @@ def main() -> int:
             "semantic_deps": bundle["semantic_deps"],
             "implementation_deps": bundle["implementation_deps"],
             "fusion_groups": bundle["fusion_groups"],
+            "repeat_groups": bundle["repeat_groups"],
+            "repeat_roles": bundle["repeat_roles"],
+            "implementation_signatures": bundle["implementation_signatures"],
+            "similarity_groups": bundle["similarity_groups"],
+            "shared_core": bundle["shared_core"],
+            "variant_deltas": bundle["variant_deltas"],
+            "prototype_refs": bundle["prototype_refs"],
             "small_elementwise_partitions": bundle["small_elementwise_partitions"],
             "paths": paths,
         }
@@ -557,6 +711,8 @@ def main() -> int:
             "paths": paths,
             "bundle": bundle_payload,
             "partitions": partition_specs,
+            "repeat_groups": repeat_group_manifest,
+            "similarity_groups": similarity_group_manifest,
             "shared_inputs": shared_inputs,
         }
         output_contract = {
@@ -619,6 +775,13 @@ def main() -> int:
             "semantic_deps": bundle["semantic_deps"],
             "implementation_deps": bundle["implementation_deps"],
             "fusion_groups": bundle["fusion_groups"],
+            "repeat_groups": bundle["repeat_groups"],
+            "repeat_roles": bundle["repeat_roles"],
+            "implementation_signatures": bundle["implementation_signatures"],
+            "similarity_groups": bundle["similarity_groups"],
+            "shared_core": bundle["shared_core"],
+            "variant_deltas": bundle["variant_deltas"],
+            "prototype_refs": bundle["prototype_refs"],
             "package_path": str(base.resolve()),
             "work_package_path": str(work_package.resolve()),
             "judge_package_path": str(judge_package.resolve()),
@@ -636,6 +799,9 @@ def main() -> int:
             "blocked_reasons": bundle["blocked_reasons"],
             "implementation_deps": bundle["implementation_deps"],
             "fusion_groups": bundle["fusion_groups"],
+            "repeat_groups": bundle["repeat_groups"],
+            "similarity_groups": bundle["similarity_groups"],
+            "prototype_refs": bundle["prototype_refs"],
         }
         for bundle in all_bundles
         if not bundle["ready"]
@@ -652,9 +818,13 @@ def main() -> int:
             "implementation_deps": "partitions with implementation_deps that point to other known partitions are packaged together",
             "can_implement_independently_false": "non-independent partitions are bundled with semantic deps when possible; unresolved singletons stay blocked",
             "small_adjacent_elementwise": "adjacent small independent elementwise partitions are merged up to max_bundle_partitions",
+            "repeat_group": "partitions may declare repeat_group, repeat_index, repeat_role, implementation_signature, and prototype_ref so prototype work can be reused by replicas",
+            "similarity_group": "partitions may declare similarity_group, shared_core, implementation_signature, and variant_delta so related variants can share a core without pretending to be identical",
             "max_bundle_partitions": max(1, args.max_bundle_partitions),
             "small_bundle_merge_enabled": not args.no_small_bundles,
         },
+        "repeat_groups": repeat_group_manifest,
+        "similarity_groups": similarity_group_manifest,
         "bundle_count": len(created),
         "partition_count": sum(len(item["partition_ids"]) for item in created),
         "ready_bundle_count": len([item for item in created if item["ready"]]),
@@ -662,10 +832,13 @@ def main() -> int:
         "bundles": created,
         "ready_bundles": [item for item in created if item["ready"]],
         "blocked_bundles": blocked,
+        "prototype_bundles": [item for item in created if "prototype" in item["repeat_roles"]],
+        "replica_bundles": [item for item in created if "replica" in item["repeat_roles"]],
         "ready_partitions": [partition_id for item in created if item["ready"] for partition_id in item["partition_ids"]],
         "blocked_partitions": [partition_id for item in blocked for partition_id in item["partition_ids"]],
         "manual_launch_instructions": [
             "Open one fresh work agent session per work_package_path that you want to run.",
+            "For repeat groups, launch prototype_bundles before replica_bundles when practical.",
             "Give the work agent only the work_package_path and ask it to follow AGENT_TASK.md.",
             "After the work agent finishes and the stage 05 main agent does any mechanical review, open a fresh judge agent session with the matching judge_package_path.",
             "Give the judge agent only the judge_package_path and ask it to follow JUDGE_TASK.md.",

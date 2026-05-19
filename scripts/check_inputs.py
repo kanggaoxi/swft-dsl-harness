@@ -41,13 +41,15 @@ def main() -> int:
     missing_required = []
     for item in config.get("external_inputs", []):
         required_for = item.get("required_for", [])
-        required_now = not stage_id or stage_id in required_for
+        optional = bool(item.get("optional", False))
+        required_now = (not optional) and (not stage_id or stage_id in required_for)
         resolved = resolve_external(config, item["label"], workspace)
         path = Path(resolved["resolved_path"])
         check = {
             "label": item["label"],
             "path": str(path),
             "exists": path.exists(),
+            "optional": optional,
             "required_for": required_for,
             "required_now": required_now,
             "path_source": resolved.get("path_source"),

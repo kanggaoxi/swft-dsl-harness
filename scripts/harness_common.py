@@ -170,6 +170,7 @@ def resolve_input_ref(config: dict[str, Any], ref: str, workspace: Path) -> dict
             "kind": "external",
             "path": str(path),
             "exists": path.exists(),
+            "optional": bool(item.get("optional", False)),
             "path_source": item.get("path_source"),
             "configured_path": item.get("path"),
             "default_path": item.get("default_path"),
