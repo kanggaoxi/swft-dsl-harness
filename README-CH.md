@@ -192,23 +192,50 @@ python3 scripts/advance_stage.py --workspace work
 
 ## DSL 子图并行实现
 
-`05_dsl_partitions` 阶段由主 agent 负责协调多个 subagent。主 agent 先生成每个
-partition 的独立任务包：
+`05_dsl_partitions` 阶段由主 agent 负责协调多个 subagent。主 agent 先生成
+partition bundle 任务包，而不是机械地一个 partition 一个 agent：
 
 ```bash
 python3 scripts/package_dsl_subagents.py --workspace work --clean
 ```
 
-如果只想打包当前可以独立实现的 partition：
+如果只想打包当前可以独立实现的 bundle：
 
 ```bash
 python3 scripts/package_dsl_subagents.py --workspace work --clean --ready-only
 ```
 
+默认打包规则是：
+
+```text
+同一个 fusion_group 的 partition 放进同一个 bundle
+存在 implementation_deps 的 partition 和它依赖的 partition 放进同一个 bundle
+can_implement_independently=false 的 partition 尽量和依赖或融合组放在一起，否则标记为 blocked
+相邻、很小、无实现依赖的 elementwise partition 会合并，默认每包最多 4 个
+semantic_deps 不阻塞并行开发，因为 03 阶段已经捕获了每个 partition 的 torch 输入
+```
+
+可以用下面参数关闭小 elementwise 合包，或调整最大合包数量：
+
+```bash
+python3 scripts/package_dsl_subagents.py --workspace work --clean --no-small-bundles
+python3 scripts/package_dsl_subagents.py --workspace work --clean --max-bundle-partitions 6
+```
+
 生成结果位于：
 
 ```text
-work/stages/05_dsl_partitions/subagent_packages/<partition_id>/
+work/stages/05_dsl_partitions/subagent_packages/<bundle_id>/
+  work_package/
+    AGENT_TASK.md
+    INPUT_MANIFEST.json
+    OUTPUT_CONTRACT.json
+    bundle.json
+    partitions/*.json
+  judge_package/
+    JUDGE_TASK.md
+    JUDGE_INPUT_MANIFEST.json
+    JUDGE_GUIDE.md
 ```
 
 同时会生成：
@@ -220,9 +247,10 @@ work/stages/05_dsl_partitions/output/subagent_task_manifest.json
 这个 manifest 会列出：
 
 ```text
-ready_partitions    可以手动开新会话并行发出去的任务
-blocked_partitions  因 implementation_deps 或 can_implement_independently=false 暂不应单独发出去的任务
-package_path        每个 subagent 任务包目录
+ready_bundles       可以手动开新 work agent 会话并行发出去的 bundle
+blocked_bundles     因实现依赖未解决而暂不应单独发出去的 bundle
+work_package_path   给 work agent 的任务包
+judge_package_path  给 judge agent 的任务包
 ```
 
 这里的依赖分两类：
@@ -232,16 +260,25 @@ semantic_deps        图语义依赖；如果 torch 已捕获该 partition 输�
 implementation_deps 实现依赖；表示 layout、融合、共享代码等未定，应该等待或合并给同一个 subagent
 ```
 
-每个 subagent 只读取自己包里的 `partition.json`、`INPUT_MANIFEST.json` 和
-`OUTPUT_CONTRACT.json`，并且只写自己的输出目录：
+每个 work agent 只读取自己 `work_package/` 里的 `AGENT_TASK.md`、`bundle.json`、
+`partitions/*.json`、`INPUT_MANIFEST.json` 和 `OUTPUT_CONTRACT.json`，并且只写自己的
+bundle 输出目录：
 
 ```text
-work/stages/05_dsl_partitions/output/partitions/<partition_id>/
+work/stages/05_dsl_partitions/output/bundles/<bundle_id>/
 ```
 
-推荐人工启动方式是：每个 `package_path` 开一个全新 agent 会话，把目录路径交给它，
-要求它阅读并执行 `AGENT_TASK.md`。不要让 subagent 修改公共 `target_dsl/` 或其他
-partition 的输出目录。
+推荐人工启动方式是：
+
+```text
+1. 对每个 ready_bundles[*].work_package_path 开一个全新 work agent 会话。
+2. 只把 work_package_path 交给它，要求它阅读并执行 AGENT_TASK.md。
+3. work agent 完成后，对应打开一个全新 judge agent 会话。
+4. 只把 matching judge_package_path 交给 judge agent，要求它阅读并执行 JUDGE_TASK.md。
+```
+
+work agent 不知道 judge 检查项；judge agent 不继承 work agent 上下文。不要让
+work agent 修改公共 `target_dsl/` 或其他 bundle 的输出目录。
 
 主 agent 收集通过验证的子图实现后，再写出：
 

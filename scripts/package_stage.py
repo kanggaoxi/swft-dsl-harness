@@ -129,15 +129,15 @@ def render_task(stage: dict, input_manifest: dict, output_contract: dict, valida
             "",
             "## Subagent Coordination",
             "",
-            "This stage is expected to be coordinated by a main agent. The main agent should create one bounded task package per partition, then assign those packages to subagents with disjoint ownership.",
+            "This stage is expected to be coordinated by a main agent. The main agent should create bounded bundle packages, then assign each work_package to an isolated work subagent and the matching judge_package to an isolated judge subagent.",
             "",
-            "Generate partition subagent packages from the repository root with:",
+            "Generate partition bundle subagent packages from the repository root with:",
             "",
             "```bash",
             f"python3 {stage['subagent_packages']['script']} --workspace work",
             "```",
             "",
-            "Each subagent package contains a single `partition.json`, the shared manifests, and a strict output contract. Subagents should not modify files owned by other partitions.",
+            "Each bundle package contains separate `work_package/` and `judge_package/` directories. Work subagents should not receive judge packages and should not modify files owned by other bundles.",
         ])
     lines.extend([
         "",

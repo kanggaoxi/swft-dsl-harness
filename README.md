@@ -194,22 +194,50 @@ and hand the new package plus the failure report to another agent.
 ## Parallel DSL Subgraphs
 
 Stage `05_dsl_partitions` is coordinated by a main agent. The main agent first
-generates one isolated task package per partition:
+generates partition bundle packages instead of blindly assigning one agent per
+partition:
 
 ```bash
 python3 scripts/package_dsl_subagents.py --workspace work --clean
 ```
 
-To package only partitions that are currently ready for independent implementation:
+To package only bundles that are currently ready for independent implementation:
 
 ```bash
 python3 scripts/package_dsl_subagents.py --workspace work --clean --ready-only
 ```
 
+Default bundle rules:
+
+```text
+partitions with the same fusion_group are packaged together
+partitions with implementation_deps are packaged with the partitions they depend on
+can_implement_independently=false partitions are grouped with deps/fusion groups when possible, otherwise marked blocked
+adjacent small independent elementwise partitions are merged, with 4 partitions per bundle by default
+semantic_deps do not block parallel work because stage 03 captured torch inputs for every partition
+```
+
+You can disable small elementwise bundling or tune the maximum bundle size:
+
+```bash
+python3 scripts/package_dsl_subagents.py --workspace work --clean --no-small-bundles
+python3 scripts/package_dsl_subagents.py --workspace work --clean --max-bundle-partitions 6
+```
+
 The generated packages are placed under:
 
 ```text
-work/stages/05_dsl_partitions/subagent_packages/<partition_id>/
+work/stages/05_dsl_partitions/subagent_packages/<bundle_id>/
+  work_package/
+    AGENT_TASK.md
+    INPUT_MANIFEST.json
+    OUTPUT_CONTRACT.json
+    bundle.json
+    partitions/*.json
+  judge_package/
+    JUDGE_TASK.md
+    JUDGE_INPUT_MANIFEST.json
+    JUDGE_GUIDE.md
 ```
 
 The script also writes:
@@ -221,9 +249,10 @@ work/stages/05_dsl_partitions/output/subagent_task_manifest.json
 That manifest lists:
 
 ```text
-ready_partitions    tasks that can be given to separate manual agent sessions
-blocked_partitions  tasks blocked by implementation_deps or can_implement_independently=false
-package_path        package directory for each subagent task
+ready_bundles       bundles that can be given to separate manual work agent sessions
+blocked_bundles     bundles blocked by unresolved implementation constraints
+work_package_path   package directory for the work agent
+judge_package_path  package directory for the judge agent
 ```
 
 Dependency fields have different meanings:
@@ -233,17 +262,26 @@ semantic_deps        graph dataflow deps; usually not a development blocker when
 implementation_deps layout, fusion, or shared-code deps; wait or group these with their dependency/fusion group
 ```
 
-Each subagent reads only its own `partition.json`, `INPUT_MANIFEST.json`, and
-`OUTPUT_CONTRACT.json`, and writes only to its own output directory:
+Each work agent reads only its own `work_package/AGENT_TASK.md`, `bundle.json`,
+`partitions/*.json`, `INPUT_MANIFEST.json`, and `OUTPUT_CONTRACT.json`, and
+writes only to its own bundle output directory:
 
 ```text
-work/stages/05_dsl_partitions/output/partitions/<partition_id>/
+work/stages/05_dsl_partitions/output/bundles/<bundle_id>/
 ```
 
-The recommended launch mode is manual: open one fresh agent session for each
-`package_path`, give that session the package path, and ask it to follow
-`AGENT_TASK.md`. Subagents should not edit shared `target_dsl/` files or any
-other partition output directory.
+The recommended launch mode is manual:
+
+```text
+1. Open one fresh work agent session per ready_bundles[*].work_package_path.
+2. Give that agent only the work_package_path and ask it to follow AGENT_TASK.md.
+3. After the work agent finishes, open one fresh judge agent session for the matching judge_package_path.
+4. Give that agent only the judge_package_path and ask it to follow JUDGE_TASK.md.
+```
+
+The work agent does not receive judge checks, and the judge agent does not
+inherit the work agent's context. Work agents should not edit shared
+`target_dsl/` files or any other bundle output directory.
 
 The main agent later collects the validated partition implementations and writes:
 
