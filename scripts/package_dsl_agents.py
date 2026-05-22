@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create isolated DSL implementation and judge packages for graph partition bundles."""
+"""Create isolated DSL implementation and judge packages for graph family bundles."""
 
 from __future__ import annotations
 
@@ -68,9 +68,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage", default=DEFAULT_STAGE)
     parser.add_argument("--partitions", default=None, help="Comma-separated partition ids to package. Defaults to all.")
     parser.add_argument("--ready-only", action="store_true", help="Package only bundles with no unresolved implementation dependencies.")
-    parser.add_argument("--max-bundle-partitions", type=int, default=DEFAULT_MAX_BUNDLE_PARTITIONS, help="Maximum number of small independent partitions to merge into one bundle.")
-    parser.add_argument("--no-small-bundles", action="store_true", help="Disable bundling of adjacent small independent elementwise partitions.")
-    parser.add_argument("--clean", action="store_true", help="Remove existing subagent package directory first.")
+    parser.add_argument("--max-bundle-partitions", type=int, default=DEFAULT_MAX_BUNDLE_PARTITIONS, help="Deprecated compatibility option; family_group controls bundle size.")
+    parser.add_argument("--no-small-bundles", action="store_true", help="Deprecated compatibility option; family_group controls bundling.")
+    parser.add_argument("--clean", action="store_true", help="Remove existing agent package directory first.")
     return parser.parse_args()
 
 
@@ -117,6 +117,14 @@ def dependency_info(partition: dict[str, Any]) -> dict[str, Any]:
     spec = partition["spec"]
     semantic_deps = listify(spec.get("semantic_deps", spec.get("dependencies", spec.get("deps"))))
     implementation_deps = listify(spec.get("implementation_deps", spec.get("impl_deps")))
+    family_group = (
+        spec.get("family_group")
+        or spec.get("family")
+        or spec.get("group")
+        or spec.get("repeat_group")
+        or spec.get("similarity_group")
+        or spec.get("fusion_group")
+    )
     fusion_group = spec.get("fusion_group")
     repeat_group = spec.get("repeat_group")
     repeat_index = spec.get("repeat_index")
@@ -137,6 +145,7 @@ def dependency_info(partition: dict[str, Any]) -> dict[str, Any]:
     return {
         "semantic_deps": semantic_deps,
         "implementation_deps": implementation_deps,
+        "family_group": family_group,
         "fusion_group": fusion_group,
         "repeat_group": repeat_group,
         "repeat_index": repeat_index,
@@ -167,6 +176,19 @@ def is_small_elementwise(partition: dict[str, Any], dep_info: dict[str, Any]) ->
     if any(hint in text for hint in HEAVY_OP_HINTS):
         return False
     return any(hint in text for hint in ELEMENTWISE_HINTS)
+
+
+def family_group_key(partition: dict[str, Any], dep_info: dict[str, Any]) -> str:
+    family_group = dep_info.get("family_group")
+    if family_group in (None, ""):
+        family_group = partition["spec"].get("family_group")
+    if family_group in (None, ""):
+        family_group = partition["spec"].get("family")
+    if family_group in (None, ""):
+        family_group = partition["spec"].get("group")
+    if family_group in (None, ""):
+        family_group = partition["id"]
+    return sanitize_id(str(family_group), partition["id"])
 
 
 class DisjointSet:
@@ -239,6 +261,7 @@ def bundle_status(bundle_partitions: list[dict[str, Any]], dep_by_id: dict[str, 
     reasons = []
     semantic_deps = []
     implementation_deps = []
+    family_groups = []
     fusion_groups = []
     repeat_groups = []
     repeat_roles = []
@@ -253,6 +276,8 @@ def bundle_status(bundle_partitions: list[dict[str, Any]], dep_by_id: dict[str, 
         info = dep_by_id[partition_id]
         semantic_deps.extend(info["semantic_deps"])
         implementation_deps.extend(info["implementation_deps"])
+        if info["family_group"] not in (None, ""):
+            family_groups.append(str(info["family_group"]))
         if info["fusion_group"] not in (None, ""):
             fusion_groups.append(str(info["fusion_group"]))
         if info["repeat_group"] not in (None, ""):
@@ -283,6 +308,7 @@ def bundle_status(bundle_partitions: list[dict[str, Any]], dep_by_id: dict[str, 
         "blocked_reasons": sorted(set(reasons)),
         "semantic_deps": sorted(set(semantic_deps)),
         "implementation_deps": sorted(set(implementation_deps)),
+        "family_groups": sorted(set(family_groups)),
         "fusion_groups": sorted(set(fusion_groups)),
         "repeat_groups": sorted(set(repeat_groups)),
         "repeat_roles": sorted(set(repeat_roles)),
@@ -371,47 +397,29 @@ def make_bundles(
     merge_small_bundles: bool,
 ) -> list[dict[str, Any]]:
     id_set = {item["id"] for item in partitions}
-    forced_groups = sorted(forced_partition_groups(partitions, dep_by_id), key=lambda group: group[0]["index"])
-    raw_bundles: list[list[dict[str, Any]]] = []
-    pending_small: list[dict[str, Any]] = []
+    family_groups: dict[str, list[dict[str, Any]]] = {}
+    for partition in partitions:
+        info = dep_by_id[partition["id"]]
+        family_key = family_group_key(partition, info)
+        family_groups.setdefault(family_key, []).append(partition)
 
-    def flush_small() -> None:
-        nonlocal pending_small
-        if pending_small:
-            raw_bundles.append(pending_small)
-            pending_small = []
-
-    for group in forced_groups:
-        is_single_small = (
-            merge_small_bundles
-            and len(group) == 1
-            and max_bundle_partitions > 1
-            and is_small_elementwise(group[0], dep_by_id[group[0]["id"]])
-        )
-        if is_single_small:
-            if pending_small and group[0]["index"] != pending_small[-1]["index"] + 1:
-                flush_small()
-            pending_small.append(group[0])
-            if len(pending_small) >= max_bundle_partitions:
-                flush_small()
-        else:
-            flush_small()
-            raw_bundles.append(group)
-    flush_small()
+    raw_bundles = [sorted(group, key=lambda item: item["index"]) for group in family_groups.values()]
+    raw_bundles.sort(key=lambda group: group[0]["index"])
 
     bundles = []
     for idx, group in enumerate(raw_bundles):
         status = bundle_status(group, dep_by_id, id_set)
-        if len(group) > 1 and status["similarity_groups"]:
-            reason = "similarity_group"
-        elif len(group) > 1 and status["small_elementwise_partitions"]:
-            reason = "small_adjacent_elementwise"
+        family_group_name = status["family_groups"][0] if status["family_groups"] else group[0]["id"]
+        if len(group) > 1:
+            reason = "family_group"
         else:
-            reason = "forced_dependency_or_single_partition"
-        bundle_id = bundle_id_for(group, idx)
+            reason = "single_partition"
+        bundle_id = sanitize_id(family_group_name, f"family_{idx:03d}")
         bundles.append({
             "bundle_id": bundle_id,
             "index": idx,
+            "family_group": family_group_name,
+            "subgraph_order": [item["id"] for item in group],
             "partition_ids": [item["id"] for item in group],
             "partitions": group,
             "bundle_reason": reason,
@@ -442,47 +450,82 @@ def accuracy_lines(precision: dict[str, Any]) -> list[str]:
 
 def render_work_task(bundle: dict[str, Any], paths: dict[str, str], precision: dict[str, Any]) -> str:
     partition_list = ", ".join(f"`{item}`" for item in bundle["partition_ids"])
-    return "\n".join([
-        f"# Subagent Work Task: Implement DSL Bundle `{bundle['bundle_id']}`",
+    subgraph_lines = []
+    for order, partition in enumerate(bundle["partitions"], start=1):
+        spec = partition["spec"]
+        family_group = spec.get("family_group") or spec.get("family") or spec.get("group") or bundle["family_group"]
+        repeat_role = spec.get("repeat_role")
+        repeat_group = spec.get("repeat_group")
+        similarity_group = spec.get("similarity_group")
+        role_bits = []
+        if repeat_role:
+            role_bits.append(f"repeat_role={repeat_role}")
+        if repeat_group:
+            role_bits.append(f"repeat_group={repeat_group}")
+        if similarity_group:
+            role_bits.append(f"similarity_group={similarity_group}")
+        role_text = f" ({', '.join(role_bits)})" if role_bits else ""
+        subgraph_lines.append(f"{order}. `{partition['id']}`{role_text} in family `{family_group}`")
+
+    lines = [
+        f"# Agent Work Task: Implement Family Bundle `{bundle['bundle_id']}`",
         "",
         "## Role",
         "",
-        "You are a bounded DSL bundle implementation agent. Other agents may implement different bundles in parallel.",
+        "You are the family work agent for one family bundle. Coordinate subgraph implementation one subgraph at a time.",
+        "If you can start child agents, start exactly one subgraph worker agent for the current subgraph, wait for it to pass golden comparison, then start the next subgraph. Never run multiple subgraph worker agents in parallel.",
         "",
         "## Objective",
         "",
         f"Implement only these partitions in SWFT DSL and validate them against torch-generated golden bins: {partition_list}.",
         "",
+        "Follow the subgraph order exactly. Finish one subgraph, verify it, then start the next one.",
+        "",
         "Do not modify other bundles. Do not change the global partition plan, golden files, harness scripts, or upstream artifacts.",
+        "",
+        "## Family",
+        "",
+        f"- family group: `{bundle['family_group']}`",
+        f"- bundle reason: `{bundle['bundle_reason']}`",
+        f"- ready: `{bundle['ready']}`",
+        f"- blocked reasons: `{bundle['blocked_reasons']}`",
+        "",
+        "## Subgraph Order",
+        "",
+        *subgraph_lines,
         "",
         "## Required Inputs",
         "",
         "Read these files from this package first:",
         "",
-        "- `bundle.json`: bundle metadata and dependency status.",
+        "- `bundle.json`: bundle metadata and family order.",
         "- `partitions/*.json`: the only partitions you own.",
         "- `INPUT_MANIFEST.json`: shared paths for model IR, partition plan, golden manifest, cases, skeleton DSL, similar DSL, SWFT flow docs, and implementation notes.",
-        "- `OUTPUT_CONTRACT.json`: files this subagent must produce.",
+        "- `OUTPUT_CONTRACT.json`: files this family work agent must produce.",
         "",
-        "## Bundle Status",
+        "## Skeleton And Output Ownership",
         "",
-        f"- ready: `{bundle['ready']}`",
-        f"- bundle reason: `{bundle['bundle_reason']}`",
+        "Use the stage 04 `target_model_dsl.py` only as a read-only skeleton reference for compile/run/file input/output structure.",
+        "Do not edit stage 04 outputs. Do not edit or create shared `target_dsl/` files in this stage.",
+        "For each subgraph, write a new partition-owned DSL implementation file at the `implementation.py` path required by `OUTPUT_CONTRACT.json`.",
+        "Any temporary generated DSL, CCE, actual bins, and debug logs must stay under this bundle's allowed output or log directory.",
+        "Stage 06 owns integrating accepted partition implementations into a full `target_model_dsl.py`.",
+        "",
+        "## Bundle Notes",
+        "",
         f"- semantic deps: `{bundle['semantic_deps']}`",
         f"- implementation deps: `{bundle['implementation_deps']}`",
-        f"- fusion groups: `{bundle['fusion_groups']}`",
         f"- repeat groups: `{bundle['repeat_groups']}`",
         f"- repeat roles: `{bundle['repeat_roles']}`",
-        f"- implementation signatures: `{bundle['implementation_signatures']}`",
         f"- similarity groups: `{bundle['similarity_groups']}`",
         f"- shared core: `{bundle['shared_core']}`",
         f"- variant deltas: `{bundle['variant_deltas']}`",
         f"- prototype refs: `{bundle['prototype_refs']}`",
-        f"- blocked reasons: `{bundle['blocked_reasons']}`",
+        f"- implementation signatures: `{bundle['implementation_signatures']}`",
         "",
         "Semantic deps describe graph dataflow and do not block isolated bundle development when torch-captured partition inputs are available.",
-        "Implementation deps describe layout, fusion, or shared code dependencies. This bundle was built to keep implementation-coupled partitions together.",
-        "Repeat groups describe structurally identical instances. Implement prototype partitions first, then adapt replicas with per-instance bindings and verify every instance.",
+        "Implementation deps describe layout, fusion, or shared code dependencies. This bundle was built as one sequential family package.",
+        "Repeat groups describe structurally identical instances. Implement the prototype first, then copy it to replicas and adapt only the per-instance bindings.",
         "Similarity groups describe related but not identical variants. Reuse the shared core where possible and implement only the documented variant deltas.",
         "If `ready` is false, stop and report the blocked status unless the main agent explicitly assigned this package with additional context.",
         "",
@@ -497,30 +540,33 @@ def render_work_task(bundle: dict[str, Any], paths: dict[str, str], precision: d
         "## Allowed Output Area",
         "",
         f"Write implementation artifacts only under `{paths['output_dir']}` and logs only under `{paths['log_dir']}`.",
+        "Do not write to `target_dsl/`, `stages/04_dsl_skeleton/`, golden directories, or other bundle output directories.",
         "",
         "## Procedure",
         "",
-        "1. Inspect `bundle.json` and every file under `partitions/` for operation sequence, inputs, outputs, shapes, dtypes, and dependencies.",
-        "2. Read the SWFT flow docs and implementation notes from `INPUT_MANIFEST.json` before writing DSL.",
-        "3. Reuse patterns from the similar DSL implementation where applicable.",
-        "4. Implement each owned partition under the partition-owned output directory listed in `OUTPUT_CONTRACT.json`.",
-        "5. Use `slice_to_ub` for GM reads and `insert_to_gm` for GM writes unless you document a reason not to.",
-        "6. Compile and run only this bundle's partition test cases.",
-        "7. Compare actual outputs against the golden bins recorded in `golden_manifest.json`.",
-        "8. When debugging a DSL compile/runtime mismatch, inspect SWFT source only for the relevant frontend/API/lowering path and record the files consulted.",
-        "9. Write every required output contract file, including bundle-level summary reports.",
+        "1. Read the bundle metadata and the subgraph order first.",
+        "2. Read the SWFT flow docs, implementation notes, and the read-only stage 04 skeleton from `INPUT_MANIFEST.json` before writing DSL.",
+        "3. For the current subgraph only, start one subgraph worker agent if available. Give it this work_package path and the current partition id; tell it to read only `partitions/<partition_id>.json`, `INPUT_MANIFEST.json`, and `OUTPUT_CONTRACT.json`.",
+        "4. The subgraph worker must create or update only that partition's required `implementation.py`, correctness report, validation notes, and artifacts under this bundle output directory.",
+        "5. The current subgraph must compile, run, and compare against its torch golden before any later subgraph starts.",
+        "6. Reuse patterns from the similar DSL implementation where applicable.",
+        "7. For repeat groups, implement the prototype first and then copy the implementation to replicas with per-instance bindings.",
+        "8. Use `slice_to_ub` for GM reads and `insert_to_gm` for GM writes unless you document a reason not to.",
+        "9. When debugging a DSL compile/runtime mismatch, inspect SWFT source only for the relevant frontend/API/lowering path and record the files consulted.",
+        "10. After every subgraph in the listed order passes, write every required output contract file, including bundle-level summary reports.",
         "",
         "## Completion Response",
         "",
         "Report only files changed, validation commands run, pass/fail status, and unresolved issues.",
         "",
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def render_judge_task(bundle: dict[str, Any], manifest: dict[str, Any], precision: dict[str, Any]) -> str:
     partition_list = ", ".join(f"`{item}`" for item in bundle["partition_ids"])
     return "\n".join([
-        f"# Subagent Judge Task: Review DSL Bundle `{bundle['bundle_id']}`",
+        f"# Agent Judge Task: Review Family Bundle `{bundle['bundle_id']}`",
         "",
         "## Role",
         "",
@@ -529,6 +575,8 @@ def render_judge_task(bundle: dict[str, Any], manifest: dict[str, Any], precisio
         "## Objective",
         "",
         f"Judge whether the work package output for these partitions is correct and ready for the stage 05 main agent to integrate: {partition_list}.",
+        "",
+        "Confirm that the work agent followed the declared subgraph order and did not process multiple subgraphs in parallel.",
         "",
         "## Inputs",
         "",
@@ -546,15 +594,17 @@ def render_judge_task(bundle: dict[str, Any], manifest: dict[str, Any], precisio
         "## Checks",
         "",
         "1. Confirm the work agent only implemented the partitions listed in this bundle.",
-        "2. Confirm every partition has implementation.py, correctness_report.json, and validation_notes.md.",
-        "3. Confirm bundle_impl_manifest.json and bundle_correctness_report.json summarize all owned partitions.",
-        "4. Confirm correctness reports compare DSL actuals against torch-generated golden bins.",
-        "5. Confirm relative error satisfies the configured partition tolerance, or that any override is explicit and justified.",
-        "6. Confirm no shared target_dsl files, upstream stage outputs, golden files, or other bundle output directories were modified by this bundle work.",
-        "7. For repeat groups, confirm replicas are adapted from the prototype with correct per-instance weights/inputs/outputs and each replica has its own golden comparison.",
-        "8. For similarity groups, confirm the shared core is reused where appropriate and each variant_delta is explicitly implemented and tested.",
-        "9. Confirm any SWFT source conclusions cite specific files or code paths, not vague compiler assumptions.",
-        "10. Confirm blocked bundles were not passed unless the work output documents the missing dependency resolution.",
+        "2. Confirm the work output documents the declared subgraph order and sequential execution.",
+        "3. Confirm every partition has implementation.py, correctness_report.json, and validation_notes.md.",
+        "4. Confirm bundle_impl_manifest.json and bundle_correctness_report.json summarize all owned partitions.",
+        "5. Confirm correctness reports compare DSL actuals against torch-generated golden bins.",
+        "6. Confirm relative error satisfies the configured partition tolerance, or that any override is explicit and justified.",
+        "7. Confirm no shared target_dsl files, upstream stage outputs, golden files, or other bundle output directories were modified by this bundle work.",
+        "8. Confirm stage 04 target_model_dsl.py was used only as a read-only skeleton reference and was not modified.",
+        "9. For repeat groups, confirm replicas are adapted from the prototype with correct per-instance weights/inputs/outputs and each replica has its own golden comparison.",
+        "10. For similarity groups, confirm the shared core is reused where appropriate and each variant_delta is explicitly implemented and tested.",
+        "11. Confirm any SWFT source conclusions cite specific files or code paths, not vague compiler assumptions.",
+        "12. Confirm blocked bundles were not passed unless the work output documents the missing dependency resolution.",
         "",
         "## Required Report",
         "",
@@ -584,21 +634,21 @@ def main() -> int:
     config_path = Path(args.config).resolve() if args.config else Path(state.get("pipeline_config", DEFAULT_CONFIG)).resolve()
     config = load_config(config_path)
     stage = stage_by_id(config, args.stage)
-    subagent_cfg = stage.get("subagent_packages", {})
-    if not subagent_cfg.get("enabled"):
-        raise SystemExit(f"stage {args.stage} does not enable subagent packages")
+    agent_cfg = stage.get("agent_packages") or stage.get("subagent_packages", {})
+    if not agent_cfg.get("enabled"):
+        raise SystemExit(f"stage {args.stage} does not enable agent packages")
 
     stage_base = stage_dir(workspace, args.stage)
-    package_dir = workspace / subagent_cfg.get("package_dir", f"stages/{args.stage}/subagent_packages")
+    package_dir = workspace / agent_cfg.get("package_dir", f"stages/{args.stage}/agent_packages")
     if args.clean and package_dir.exists():
         shutil.rmtree(package_dir)
     package_dir.mkdir(parents=True, exist_ok=True)
-    bundle_judge_root = stage_base / "judge" / "subagents"
+    bundle_judge_root = stage_base / "judge" / "agents"
     if args.clean and bundle_judge_root.exists():
         shutil.rmtree(bundle_judge_root)
     bundle_judge_root.mkdir(parents=True, exist_ok=True)
 
-    partition_plan_ref = subagent_cfg.get("partition_plan", "stage:02_partition/output/partition_plan.json")
+    partition_plan_ref = agent_cfg.get("partition_plan", "stage:02_partition/output/partition_plan.json")
     partition_plan_path = Path(resolve_input_ref(config, partition_plan_ref, workspace)["path"])
     if not partition_plan_path.exists():
         raise SystemExit(f"partition plan does not exist: {partition_plan_path}")
@@ -667,6 +717,8 @@ def main() -> int:
             partition_payload = {
                 "id": partition_id,
                 "index": partition["index"],
+                "order": len(partition_specs) + 1,
+                "family_group": bundle["family_group"],
                 "dependency_info": dep_by_id[partition_id],
                 "bundle_id": bundle_id,
                 "spec": partition["spec"],
@@ -683,10 +735,13 @@ def main() -> int:
         bundle_payload = {
             "bundle_id": bundle_id,
             "index": bundle["index"],
+            "family_group": bundle["family_group"],
             "partition_ids": bundle["partition_ids"],
+            "subgraph_order": bundle["subgraph_order"],
             "bundle_reason": bundle["bundle_reason"],
             "ready": bundle["ready"],
             "blocked_reasons": bundle["blocked_reasons"],
+            "family_groups": bundle["family_groups"],
             "semantic_deps": bundle["semantic_deps"],
             "implementation_deps": bundle["implementation_deps"],
             "fusion_groups": bundle["fusion_groups"],
@@ -698,19 +753,23 @@ def main() -> int:
             "variant_deltas": bundle["variant_deltas"],
             "prototype_refs": bundle["prototype_refs"],
             "small_elementwise_partitions": bundle["small_elementwise_partitions"],
+            "subgraph_specs": partition_specs,
             "paths": paths,
         }
         save_json(work_package / "bundle.json", bundle_payload)
         input_manifest = {
             "stage": args.stage,
             "bundle_id": bundle_id,
+            "family_group": bundle["family_group"],
             "partition_ids": bundle["partition_ids"],
+            "subgraph_order": bundle["subgraph_order"],
             "created_at": now_iso(),
             "workspace": str(workspace),
             "precision": config.get("precision", {}),
             "paths": paths,
             "bundle": bundle_payload,
             "partitions": partition_specs,
+            "subgraph_specs": partition_specs,
             "repeat_groups": repeat_group_manifest,
             "similarity_groups": similarity_group_manifest,
             "shared_inputs": shared_inputs,
@@ -746,7 +805,9 @@ def main() -> int:
         judge_manifest = {
             "stage": args.stage,
             "bundle_id": bundle_id,
+            "family_group": bundle["family_group"],
             "partition_ids": bundle["partition_ids"],
+            "subgraph_order": bundle["subgraph_order"],
             "created_at": now_iso(),
             "workspace": str(workspace),
             "precision": config.get("precision", {}),
@@ -768,10 +829,13 @@ def main() -> int:
 
         created.append({
             "bundle_id": bundle_id,
+            "family_group": bundle["family_group"],
             "partition_ids": bundle["partition_ids"],
+            "subgraph_order": bundle["subgraph_order"],
             "bundle_reason": bundle["bundle_reason"],
             "ready": bundle["ready"],
             "blocked_reasons": bundle["blocked_reasons"],
+            "family_groups": bundle["family_groups"],
             "semantic_deps": bundle["semantic_deps"],
             "implementation_deps": bundle["implementation_deps"],
             "fusion_groups": bundle["fusion_groups"],
@@ -793,10 +857,13 @@ def main() -> int:
     blocked = [
         {
             "bundle_id": bundle["bundle_id"],
+            "family_group": bundle["family_group"],
             "partition_ids": bundle["partition_ids"],
+            "subgraph_order": bundle["subgraph_order"],
             "index": bundle["index"],
             "bundle_reason": bundle["bundle_reason"],
             "blocked_reasons": bundle["blocked_reasons"],
+            "family_groups": bundle["family_groups"],
             "implementation_deps": bundle["implementation_deps"],
             "fusion_groups": bundle["fusion_groups"],
             "repeat_groups": bundle["repeat_groups"],
@@ -814,14 +881,11 @@ def main() -> int:
         "launch_mode": "manual_sessions",
         "ready_only": args.ready_only,
         "bundle_policy": {
-            "fusion_group": "partitions with the same fusion_group are packaged together",
-            "implementation_deps": "partitions with implementation_deps that point to other known partitions are packaged together",
-            "can_implement_independently_false": "non-independent partitions are bundled with semantic deps when possible; unresolved singletons stay blocked",
-            "small_adjacent_elementwise": "adjacent small independent elementwise partitions are merged up to max_bundle_partitions",
-            "repeat_group": "partitions may declare repeat_group, repeat_index, repeat_role, implementation_signature, and prototype_ref so prototype work can be reused by replicas",
-            "similarity_group": "partitions may declare similarity_group, shared_core, implementation_signature, and variant_delta so related variants can share a core without pretending to be identical",
-            "max_bundle_partitions": max(1, args.max_bundle_partitions),
-            "small_bundle_merge_enabled": not args.no_small_bundles,
+            "family_group": "partitions with the same family_group are packaged together for one human-managed work session",
+            "subgraph_order": "partitions inside one family bundle are executed strictly in index order",
+            "implementation_deps": "partitions with implementation_deps that point to other known partitions are packaged together only when they stay inside the same family bundle",
+            "repeat_group": "partitions may declare repeat_group, repeat_index, repeat_role, implementation_signature, and prototype_ref so prototype work can be reused by replicas inside the family bundle",
+            "similarity_group": "partitions may declare similarity_group, shared_core, implementation_signature, and variant_delta so related variants can share a core while staying inside the same family bundle",
         },
         "repeat_groups": repeat_group_manifest,
         "similarity_groups": similarity_group_manifest,
@@ -837,18 +901,18 @@ def main() -> int:
         "ready_partitions": [partition_id for item in created if item["ready"] for partition_id in item["partition_ids"]],
         "blocked_partitions": [partition_id for item in blocked for partition_id in item["partition_ids"]],
         "manual_launch_instructions": [
-            "Open one fresh work agent session per work_package_path that you want to run.",
-            "For repeat groups, launch prototype_bundles before replica_bundles when practical.",
-            "Give the work agent only the work_package_path and ask it to follow AGENT_TASK.md.",
-            "After the work agent finishes and the stage 05 main agent does any mechanical review, open a fresh judge agent session with the matching judge_package_path.",
+            "Open one fresh work agent session per ready_bundles[*].work_package_path.",
+            "Give each work agent only its own work_package_path and ask it to follow AGENT_TASK.md.",
+            "Inside one family bundle, the family work agent may start one subgraph worker agent for the current subgraph, but must wait for it to pass before starting the next one.",
+            "After the work agent finishes, open a fresh judge agent session with the matching judge_package_path.",
             "Give the judge agent only the judge_package_path and ask it to follow JUDGE_TASK.md.",
             "Do not let work agents edit shared target_dsl files or other bundle output directories.",
-            "After work and judge agents finish, the stage 05 main agent reviews accepted bundle outputs and writes the aggregate manifests."
+            "After work and judge agents finish, the stage 05 main agent reviews accepted family bundle outputs and writes the aggregate manifests."
         ],
     }
-    manifest_path = stage_base / "output" / "subagent_task_manifest.json"
+    manifest_path = stage_base / "output" / "agent_task_manifest.json"
     save_json(manifest_path, manifest)
-    print(f"created {len(created)} subagent bundle package(s): {package_dir}")
+    print(f"created {len(created)} family agent package(s): {package_dir}")
     print(f"manifest: {manifest_path}")
     return 0
 

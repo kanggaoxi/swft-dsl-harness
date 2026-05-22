@@ -16,7 +16,7 @@ Default stages:
 2. `02_partition`: split the validated IR into SWFT-friendly partitions.
 3. `03_torch_golden`: capture per-partition input and golden output bins from PyTorch using the configured dtype policy.
 4. `04_dsl_skeleton`: prove the SWFT compile/run/file I/O loop works.
-5. `05_dsl_partitions`: a main agent coordinates multiple subagents to implement partitions.
+5. `05_dsl_partitions`: a main agent coordinates multiple family agents to implement partition families.
 6. `06_dsl_integrate`: merge accepted partition implementations into a full DSL.
 7. `07_perf`: optimize latency without breaking correctness.
 
@@ -205,29 +205,27 @@ and hand the new package plus the failure report to another agent.
 ## Parallel DSL Subgraphs
 
 Stage `05_dsl_partitions` is coordinated by a main agent. The main agent first
-generates partition bundle packages instead of blindly assigning one agent per
+generates family bundle packages instead of blindly assigning one agent per
 partition:
 
 ```bash
-python3 scripts/package_dsl_subagents.py --workspace work --clean
+python3 scripts/package_dsl_agents.py --workspace work --clean
 ```
 
 To package only bundles that are currently ready for independent implementation:
 
 ```bash
-python3 scripts/package_dsl_subagents.py --workspace work --clean --ready-only
+python3 scripts/package_dsl_agents.py --workspace work --clean --ready-only
 ```
 
 Default bundle rules:
 
 ```text
-partitions with the same fusion_group are packaged together
-partitions with implementation_deps are packaged with the partitions they depend on
-can_implement_independently=false partitions are grouped with deps/fusion groups when possible, otherwise marked blocked
-adjacent small independent elementwise partitions are merged, with 4 partitions per bundle by default
+partitions with the same family_group are packaged together
+subgraphs inside one family bundle must run sequentially in subgraph_order
 repeat_group handles exact repeated structures: implement a prototype first, then adapt replicas with per-instance bindings
 similarity_group handles related but non-identical structures: reuse shared_core and implement variant_delta differences
-semantic_deps do not block parallel work because stage 03 captured torch inputs for every partition
+semantic_deps do not block sequential family work because stage 03 captured torch inputs for every partition
 ```
 
 Stage `02_partition` can write these fields in `partition_plan.json` to guide
@@ -236,6 +234,7 @@ stage 05:
 ```json
 {
   "id": "layer0_block",
+  "family_group": "encoder_stack",
   "repeat_group": "transformer_block",
   "repeat_index": 0,
   "repeat_role": "prototype",
@@ -248,6 +247,7 @@ Replica layers can reference the prototype:
 ```json
 {
   "id": "layer1_block",
+  "family_group": "encoder_stack",
   "repeat_group": "transformer_block",
   "repeat_index": 1,
   "repeat_role": "replica",
@@ -261,6 +261,7 @@ For similar but non-identical subgraphs, use similarity metadata instead:
 ```json
 {
   "id": "variant_a",
+  "family_group": "output_heads",
   "similarity_group": "attention_family",
   "implementation_signature": "attention_core_v1",
   "shared_core": ["qkv_matmul", "scale", "softmax"],
@@ -271,17 +272,18 @@ For similar but non-identical subgraphs, use similarity metadata instead:
 }
 ```
 
-You can disable small elementwise bundling or tune the maximum bundle size:
+Stage 05 package count is controlled by `family_group`. These legacy options are
+still accepted by the script, but they no longer decide family bundle size:
 
 ```bash
-python3 scripts/package_dsl_subagents.py --workspace work --clean --no-small-bundles
-python3 scripts/package_dsl_subagents.py --workspace work --clean --max-bundle-partitions 6
+python3 scripts/package_dsl_agents.py --workspace work --clean --no-small-bundles
+python3 scripts/package_dsl_agents.py --workspace work --clean --max-bundle-partitions 6
 ```
 
 The generated packages are placed under:
 
 ```text
-work/stages/05_dsl_partitions/subagent_packages/<bundle_id>/
+work/stages/05_dsl_partitions/agent_packages/<bundle_id>/
   work_package/
     AGENT_TASK.md
     INPUT_MANIFEST.json
@@ -297,7 +299,7 @@ work/stages/05_dsl_partitions/subagent_packages/<bundle_id>/
 The script also writes:
 
 ```text
-work/stages/05_dsl_partitions/output/subagent_task_manifest.json
+work/stages/05_dsl_partitions/output/agent_task_manifest.json
 ```
 
 That manifest lists:
@@ -307,15 +309,19 @@ ready_bundles       bundles that can be given to separate manual work agent sess
 blocked_bundles     bundles blocked by unresolved implementation constraints
 work_package_path   package directory for the work agent
 judge_package_path  package directory for the judge agent
+family_group        family handled by this bundle
+subgraph_order      sequential subgraph order inside the family bundle
 repeat_groups       prototype/replica metadata for repeated structures
 similarity_groups   shared_core/variant_delta metadata for related variants
 ```
 
-Dependency fields have different meanings:
+Important fields:
 
 ```text
-semantic_deps        graph dataflow deps; usually not a development blocker when torch-captured partition inputs exist
-implementation_deps layout, fusion, or shared-code deps; wait or group these with their dependency/fusion group
+family_group         family handled by one manual work agent session
+subgraph_order       order that subgraphs must be implemented and verified in
+semantic_deps        graph dataflow deps; usually not a blocker when torch-captured partition inputs exist
+implementation_deps layout, fusion, or shared-code deps; keep these inside one family bundle when possible
 ```
 
 Each work agent reads only its own `work_package/AGENT_TASK.md`, `bundle.json`,
@@ -326,13 +332,20 @@ writes only to its own bundle output directory:
 work/stages/05_dsl_partitions/output/bundles/<bundle_id>/
 ```
 
+Stage 05 family agents do not edit the stage 04 `target_model_dsl.py` and do not
+write shared `target_dsl/` files. The stage 04 skeleton is a read-only reference
+for compile, execution, and file I/O structure. Each subgraph implementation is
+written to the partition-owned `implementation.py`; stage 06 later integrates
+accepted implementations into a full `target_model_dsl.py`.
+
 The recommended launch mode is manual:
 
 ```text
 1. Open one fresh work agent session per ready_bundles[*].work_package_path.
 2. Give that agent only the work_package_path and ask it to follow AGENT_TASK.md.
-3. After the work agent finishes, open one fresh judge agent session for the matching judge_package_path.
-4. Give that agent only the judge_package_path and ask it to follow JUDGE_TASK.md.
+3. The family work agent may start one subgraph worker agent for the current subgraph, but must wait for it to pass before starting the next one.
+4. After the work agent finishes, open one fresh judge agent session for the matching judge_package_path.
+5. Give that agent only the judge_package_path and ask it to follow JUDGE_TASK.md.
 ```
 
 The work agent does not receive judge checks, and the judge agent does not
@@ -347,7 +360,7 @@ work/stages/05_dsl_partitions/output/dsl_progress.json
 work/stages/05_dsl_partitions/output/partition_correctness_report.json
 ```
 
-This keeps different subagents isolated while they work on different subgraphs.
+This keeps different family agents isolated while they work on different families.
 
 ## Contract
 

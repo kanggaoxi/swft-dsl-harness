@@ -51,7 +51,7 @@ judge agent 的职责不是继续实现，而是独立判断当前阶段是否�
 
 ### 05_dsl_partitions
 
-- 每个 subagent 是否只实现自己拥有的 partition。
+- 每个 work agent 是否只实现自己拥有的 partition。
 - 每个 partition 是否有独立 correctness report。
 - 主 agent 是否只集成已通过的 partition。
 - 误差是否按 torch golden vs DSL actual 计算，并使用配置的 partition 默认阈值或记录了明确例外。

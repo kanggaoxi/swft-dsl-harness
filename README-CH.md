@@ -202,29 +202,27 @@ python3 scripts/advance_stage.py --workspace work
 
 ## DSL 子图并行实现
 
-`05_dsl_partitions` 阶段由主 agent 负责协调多个 subagent。主 agent 先生成
-partition bundle 任务包，而不是机械地一个 partition 一个 agent：
+`05_dsl_partitions` 阶段由主 agent 负责协调多个 family agent。主 agent 先按
+family 生成任务包，而不是机械地一个 partition 一个 agent：
 
 ```bash
-python3 scripts/package_dsl_subagents.py --workspace work --clean
+python3 scripts/package_dsl_agents.py --workspace work --clean
 ```
 
 如果只想打包当前可以独立实现的 bundle：
 
 ```bash
-python3 scripts/package_dsl_subagents.py --workspace work --clean --ready-only
+python3 scripts/package_dsl_agents.py --workspace work --clean --ready-only
 ```
 
 默认打包规则是：
 
 ```text
-同一个 fusion_group 的 partition 放进同一个 bundle
-存在 implementation_deps 的 partition 和它依赖的 partition 放进同一个 bundle
-can_implement_independently=false 的 partition 尽量和依赖或融合组放在一起，否则标记为 blocked
-相邻、很小、无实现依赖的 elementwise partition 会合并，默认每包最多 4 个
+同一个 family_group 的 partition 放进同一个 family bundle
+family bundle 内的子图必须按 subgraph_order 串行执行
 repeat_group 用于完全重复结构：先实现 prototype，再按 per-instance 绑定适配 replica
 similarity_group 用于相似但不完全相同结构：复用 shared_core，只实现 variant_delta
-semantic_deps 不阻塞并行开发，因为 03 阶段已经捕获了每个 partition 的 torch 输入
+semantic_deps 不阻塞 family bundle 内串行开发，因为 03 阶段已经捕获了每个 partition 的 torch 输入
 ```
 
 `02_partition` 阶段可以在 `partition_plan.json` 里写这些字段来指导 05 阶段：
@@ -232,6 +230,7 @@ semantic_deps 不阻塞并行开发，因为 03 阶段已经捕获了每个 part
 ```json
 {
   "id": "layer0_block",
+  "family_group": "encoder_stack",
   "repeat_group": "transformer_block",
   "repeat_index": 0,
   "repeat_role": "prototype",
@@ -244,6 +243,7 @@ semantic_deps 不阻塞并行开发，因为 03 阶段已经捕获了每个 part
 ```json
 {
   "id": "layer1_block",
+  "family_group": "encoder_stack",
   "repeat_group": "transformer_block",
   "repeat_index": 1,
   "repeat_role": "replica",
@@ -257,6 +257,7 @@ semantic_deps 不阻塞并行开发，因为 03 阶段已经捕获了每个 part
 ```json
 {
   "id": "variant_a",
+  "family_group": "output_heads",
   "similarity_group": "attention_family",
   "implementation_signature": "attention_core_v1",
   "shared_core": ["qkv_matmul", "scale", "softmax"],
@@ -267,17 +268,18 @@ semantic_deps 不阻塞并行开发，因为 03 阶段已经捕获了每个 part
 }
 ```
 
-可以用下面参数关闭小 elementwise 合包，或调整最大合包数量：
+05 阶段的包数量由 `family_group` 决定。下面这些旧参数仍可被脚本接受，
+但不再决定 family 打包粒度：
 
 ```bash
-python3 scripts/package_dsl_subagents.py --workspace work --clean --no-small-bundles
-python3 scripts/package_dsl_subagents.py --workspace work --clean --max-bundle-partitions 6
+python3 scripts/package_dsl_agents.py --workspace work --clean --no-small-bundles
+python3 scripts/package_dsl_agents.py --workspace work --clean --max-bundle-partitions 6
 ```
 
 生成结果位于：
 
 ```text
-work/stages/05_dsl_partitions/subagent_packages/<bundle_id>/
+work/stages/05_dsl_partitions/agent_packages/<bundle_id>/
   work_package/
     AGENT_TASK.md
     INPUT_MANIFEST.json
@@ -293,7 +295,7 @@ work/stages/05_dsl_partitions/subagent_packages/<bundle_id>/
 同时会生成：
 
 ```text
-work/stages/05_dsl_partitions/output/subagent_task_manifest.json
+work/stages/05_dsl_partitions/output/agent_task_manifest.json
 ```
 
 这个 manifest 会列出：
@@ -303,15 +305,19 @@ ready_bundles       可以手动开新 work agent 会话并行发出去的 bundl
 blocked_bundles     因实现依赖未解决而暂不应单独发出去的 bundle
 work_package_path   给 work agent 的任务包
 judge_package_path  给 judge agent 的任务包
+family_group        这个 bundle 负责的 family
+subgraph_order      family 包内必须串行执行的子图顺序
 repeat_groups       重复结构的 prototype/replica 信息
 similarity_groups   相似结构的 shared_core/variant_delta 信息
 ```
 
-这里的依赖分两类：
+这里的关键字段是：
 
 ```text
-semantic_deps        图语义依赖；如果 torch 已捕获该 partition 输入，通常不阻塞独立开发
-implementation_deps 实现依赖；表示 layout、融合、共享代码等未定，应该等待或合并给同一个 subagent
+family_group         一个手动 work agent 会话对应的 family
+subgraph_order       family 包内必须串行执行的顺序
+semantic_deps        图语义依赖；如果 torch 已捕获该 partition 输入，通常不阻塞 family 内串行开发
+implementation_deps 实现依赖；表示 layout、融合、共享代码等应保持在同一个 family 包内
 ```
 
 每个 work agent 只读取自己 `work_package/` 里的 `AGENT_TASK.md`、`bundle.json`、
@@ -322,13 +328,19 @@ bundle 输出目录：
 work/stages/05_dsl_partitions/output/bundles/<bundle_id>/
 ```
 
+05 阶段不会让 family agent 修改 04 阶段的 `target_model_dsl.py`，也不会让它们写公共
+`target_dsl/`。04 阶段的 skeleton 只作为只读参考，用来复用编译、执行、文件输入输出链路。
+每个子图实现都写到自己 partition 输出目录下的 `implementation.py`；06 阶段再负责把通过
+验收的实现合成完整 `target_model_dsl.py`。
+
 推荐人工启动方式是：
 
 ```text
 1. 对每个 ready_bundles[*].work_package_path 开一个全新 work agent 会话。
 2. 只把 work_package_path 交给它，要求它阅读并执行 AGENT_TASK.md。
-3. work agent 完成后，对应打开一个全新 judge agent 会话。
-4. 只把 matching judge_package_path 交给 judge agent，要求它阅读并执行 JUDGE_TASK.md。
+3. family work agent 可以给当前子图起一个子图 worker agent，但必须等它对拍通过后再起下一个。
+4. work agent 完成后，对应打开一个全新 judge agent 会话。
+5. 只把 matching judge_package_path 交给 judge agent，要求它阅读并执行 JUDGE_TASK.md。
 ```
 
 work agent 不知道 judge 检查项；judge agent 不继承 work agent 上下文。不要让
@@ -342,7 +354,7 @@ work/stages/05_dsl_partitions/output/dsl_progress.json
 work/stages/05_dsl_partitions/output/partition_correctness_report.json
 ```
 
-这样可以让多个 subagent 并行开发不同子图，同时避免互相修改同一批文件。
+这样可以让多个 family agent 并行开发不同 family，同时避免互相修改同一批文件。
 
 ## 契约
 

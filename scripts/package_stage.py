@@ -133,20 +133,21 @@ def render_task(stage: dict, input_manifest: dict, output_contract: dict, valida
     ])
     for path in stage.get("allowed_edits", []):
         lines.append(f"- `{path}`")
-    if stage.get("subagent_packages", {}).get("enabled"):
+    agent_package_cfg = stage.get("agent_packages") or stage.get("subagent_packages", {})
+    if agent_package_cfg.get("enabled"):
         lines.extend([
             "",
-            "## Subagent Coordination",
+            "## Agent Coordination",
             "",
-            "This stage is expected to be coordinated by a main agent. The main agent should create bounded bundle packages, then assign each work_package to an isolated work subagent and the matching judge_package to an isolated judge subagent.",
+            "This stage is expected to be coordinated by a main agent. The main agent should create family bundle packages, then assign each work_package to an isolated work agent and the matching judge_package to an isolated judge agent.",
             "",
-            "Generate partition bundle subagent packages from the repository root with:",
+            "Generate family bundle agent packages from the repository root with:",
             "",
             "```bash",
-            f"python3 {stage['subagent_packages']['script']} --workspace work",
+            f"python3 {agent_package_cfg['script']} --workspace work",
             "```",
             "",
-            "Each bundle package contains separate `work_package/` and `judge_package/` directories. Work subagents should not receive judge packages and should not modify files owned by other bundles.",
+            "Each family bundle package contains separate `work_package/` and `judge_package/` directories. Work agents should not receive judge packages, should not modify files owned by other bundles, and should process subgraphs in the declared order. A family work agent may start one subgraph worker agent at a time, but must not run multiple subgraph agents in parallel. Stage 04 target_model_dsl.py is a read-only skeleton reference; stage 05 agents write partition-owned implementation.py files under their bundle output directory, and stage 06 owns final integration.",
         ])
     lines.extend([
         "",

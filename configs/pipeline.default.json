@@ -144,6 +144,7 @@
         "Read the similar DSL only for implementation patterns and likely fusion boundaries, not as a semantic source for the target model.",
         "Create partitions that cover the full IR with explicit inputs, outputs, dependencies, node ids, dtypes, and shapes.",
         "For every partition, write semantic_deps, implementation_deps, fusion_group, can_implement_independently, input_contract, and output_contract.",
+        "Also write family_group for the human-managed stage 05 work unit. Partitions that should be handled in one family package must share the same family_group, for example frontend, encoder_stack, or output_heads.",
         "When the IR contains repeated structures, also write repeat_group, repeat_index, repeat_role, implementation_signature, and prototype_ref where applicable.",
         "When partitions are related but not identical, write similarity_group, shared_core, implementation_signature, and variant_delta instead of pretending they are exact replicas.",
         "Mark fusion opportunities, cube/matmul regions, expected tiling axes, and SWFT implementation risks such as concat plus non-regular nd_to_nz.",
@@ -157,7 +158,8 @@
       "judge_checklist": [
         "The partition plan covers the complete validated IR without duplicate ownership.",
         "Each partition has clear inputs, outputs, node list, shape/dtype metadata, and dependencies.",
-        "Each partition declares semantic_deps and implementation_deps so stage 05 can decide which subagents can run in parallel.",
+        "Each partition declares semantic_deps and implementation_deps so stage 05 can decide which work agents can run in parallel.",
+        "Each partition that should be handled in one human-managed stage 05 family package has a clear family_group.",
         "Repeated structures use repeat_group metadata so stage 05 can implement a prototype first and adapt replicas.",
         "Similar variants use similarity_group plus shared_core and variant_delta so stage 05 can reuse common code without assuming exact identity.",
         "The plan uses SWFT implementation notes to flag risky concat, transpose, matmul, and padding areas.",
@@ -263,13 +265,13 @@
       "id": "05_dsl_partitions",
       "name": "SWFT DSL partition implementations",
       "agent_role": "DSL main implementation agent",
-      "objective": "The main agent coordinates multiple subagents. Each work subagent implements one disjoint partition bundle using the partition plan and torch-generated golden bins, and a separate judge subagent reviews that bundle output. The main agent integrates accepted partition implementations.",
-      "subagent_packages": {
+      "objective": "The main agent coordinates multiple family bundles. Each work agent implements one family bundle in strict subgraph order using the partition plan and torch-generated golden bins, and a separate judge agent reviews that bundle output. The main agent integrates accepted partition implementations.",
+      "agent_packages": {
         "enabled": true,
-        "script": "scripts/package_dsl_subagents.py",
+        "script": "scripts/package_dsl_agents.py",
         "partition_plan": "stage:02_partition/output/partition_plan.json",
         "golden_manifest": "stage:03_torch_golden/output/golden_manifest.json",
-        "package_dir": "stages/05_dsl_partitions/subagent_packages"
+        "package_dir": "stages/05_dsl_partitions/agent_packages"
       },
       "input_refs": [
         "stage:01_torch_export/output/model_ir.json",
@@ -284,42 +286,49 @@
       ],
       "allowed_edits": [
         "stages/05_dsl_partitions/output/**",
-        "stages/05_dsl_partitions/logs/**",
-        "target_dsl/**"
+        "stages/05_dsl_partitions/logs/**"
       ],
       "procedure": [
-        "Generate partition bundle subagent packages with package_dsl_subagents.py.",
-        "Read subagent_task_manifest.json to distinguish ready_bundles and blocked_bundles.",
-        "Use repeat_groups to schedule prototype bundles before replica bundles when exact repeated structures exist.",
-        "Use similarity_groups to keep shared core and variant_delta information available to related bundle work agents.",
+        "Generate family bundle agent packages with package_dsl_agents.py.",
+        "Read agent_task_manifest.json to distinguish ready_bundles and blocked_bundles.",
+        "Treat stage 04 target_model_dsl.py as a read-only skeleton reference for compile/run/file-IO structure. Do not edit it, and do not write shared target_dsl files in stage 05.",
+        "Treat each ready bundle as one human-managed family package. Inside the package, follow the subgraph_order exactly and process subgraphs one at a time.",
+        "A family work agent may start one subgraph worker agent for the current subgraph, but must wait for that subgraph to pass golden comparison before starting the next subgraph.",
+        "Use repeat_groups to place prototype subgraphs before replica subgraphs within the same family package when exact repeated structures exist.",
+        "Use similarity_groups to keep shared core and variant_delta information available to related subgraph work.",
         "For manual launch, open one fresh work agent session per ready bundle work_package_path and give it only that package path.",
         "After a work agent finishes, open a separate fresh judge agent session with the matching judge_package_path.",
-        "Do not launch blocked bundles until implementation_deps are resolved or the main agent groups them with their dependency/fusion group.",
-        "Require every work subagent to compile, run, and compare its bundle partitions against torch-generated golden with the configured partition tolerance.",
+        "Do not run subgraphs in parallel inside one family package. Finish one subgraph, verify it against golden, then start the next subgraph.",
+        "Do not launch blocked bundles until implementation_deps are resolved or the main agent groups them with their family bundle.",
+        "Require every work agent to compile, run, and compare its family subgraphs against torch-generated golden with the configured partition tolerance.",
         "Subgraph tests should feed each DSL partition with torch-captured partition inputs so partition errors are isolated.",
         "Review work and judge outputs and integrate only partitions with passing correctness reports and passing bundle judge reports.",
         "Write partition_impl_manifest.json, dsl_progress.json, partition_correctness_report.json, and validation_notes.md."
       ],
       "quality_checks": [
-        "Work subagents must not receive judge package contents or judge-specific checks.",
-        "Judge subagents must not inherit work subagent context.",
-        "Work subagents must not edit each other's bundle outputs.",
-        "Work subagents must write only their bundle-owned reports, partition-owned implementation.py, correctness_report.json, validation_notes.md, and artifacts.",
+        "Work agents must not receive judge package contents or judge-specific checks.",
+        "Judge agents must not inherit work agent context.",
+        "Work agents must not edit each other's bundle outputs.",
+        "Work agents must not edit stage 04 target_model_dsl.py or any shared target_dsl file; stage 06 owns final integration.",
+        "Work agents must process subgraphs in the declared order and must not run multiple subgraphs in parallel inside one family package.",
+        "Work agents must write only their bundle-owned reports, partition-owned implementation.py, correctness_report.json, validation_notes.md, and artifacts.",
         "Every implemented partition must have a correctness report with relative error or a documented override.",
         "Prototype/replica reuse must not accidentally reuse the wrong weights, inputs, outputs, or golden bins.",
         "Similarity-group variants must document which shared_core was reused and which variant_delta was implemented.",
         "The main agent must clearly list accepted, rejected, blocked, and missing bundles and partitions."
       ],
       "judge_checklist": [
-        "subagent_task_manifest.json matches the partition plan and documents the bundling policy.",
-        "subagent_task_manifest.json clearly separates ready_bundles and blocked_bundles and includes both work_package_path and judge_package_path for created bundles.",
+        "agent_task_manifest.json matches the partition plan and documents the bundling policy.",
+        "agent_task_manifest.json clearly separates ready_bundles and blocked_bundles and includes both work_package_path and judge_package_path for created bundles.",
+        "Each ready bundle exposes a deterministic subgraph order and the work output follows that order sequentially.",
+        "Bundle work outputs stay inside the bundle output directory and do not modify stage 04 target_model_dsl.py or shared target_dsl files.",
         "partition_impl_manifest.json includes only partitions with evidence-backed correctness reports and passing bundle judge reports.",
         "repeat_groups and similarity_groups are reflected in the bundle outputs when present.",
         "partition_correctness_report.json compares DSL actuals against torch-generated golden bins with the configured partition tolerance, or records a documented override.",
         "dsl_progress.json clearly reports implemented and pending partitions."
       ],
       "required_outputs": [
-        "output/subagent_task_manifest.json",
+        "output/agent_task_manifest.json",
         "output/partition_impl_manifest.json",
         "output/dsl_progress.json",
         "output/partition_correctness_report.json",
