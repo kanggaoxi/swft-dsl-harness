@@ -72,7 +72,7 @@
 旧 harness 有个观察到的 bug:04 阶段专门趟平编译/IO 路径,但 05 实现 DSL 时还在 input 路径上犯同样的错——经验没传下去。
 
 三层架构让这个问题**消失**,而不是"修复":
-- 每个范本本身就是自带 `gen_golden_data` + `@sub_kernel` + `compile_kernel`/`exec_kernel` + `verify_result` 的**完整可跑通小程序**。
+- 每个范本本身就是自带 **参考数据生成 + `@sub_kernel` + `compile_kernel`/`exec_kernel` + `verify_result` 对拍**的**完整可跑通小程序**。(注:参考数据生成有两种形式——约 20/44 范本是具名 `gen_golden_data()` 函数,其余约 22 个是 inline numpy 造数。worker 改写时两种都要能识别,见 5.3。)
 - 算子 worker 抄范本时,IO/编译链路就是现成跑通的;它对拍不过会立刻在自己这一层发现,不会把错带到下游。
 - 所以"04 趟平的 IO 经验要传给 05"这个需求根本不存在了——它变成了"范本自带正确链路"的副作用。
 
@@ -113,7 +113,7 @@
 - 路径 `/home/kgx/code/kernel/reverse/akg/swft/op_test`,44 个算子范本。
 - **42 个是 `@sub_kernel` 风格(要的)**;只有 2 个 `ms_*` 是 MindSpore/jit(`math/ms_tanh.py`、`fusion/ms_reshape_and_cache.py`),**排除**。
 - SWFT 有 3 条路径(见 `swft/README.md`):`@sub_kernel`(要)、MindSpore 原生、Python `@swft.jit`。**只索引同时含 `@sub_kernel` 且含 `compile_kernel` 的范本。**
-- 每个范本是 ~100–330 行的**自包含完整程序**(单个约 3–4k token,per-operator 注入一整段在 400k 窗口里毫无压力),自带 `gen_golden_data` + `@sub_kernel` 实现 + `compile_kernel`/`exec_kernel` + 调 `verify_result.py` 对拍。
+- 每个范本是 ~100–330 行的**自包含完整程序**(单个约 3–4k token,per-operator 注入一整段在 400k 窗口里毫无压力),自带**参考数据生成**(具名 `gen_golden_data` 或 inline numpy,两种形态见 5.3) + `@sub_kernel` 实现 + `compile_kernel`/`exec_kernel` + 调 `verify_result.py` 对拍。
 - 已分类:`bmm/gmm/matmul/pa/reduce/math/fusion`,文件名直接编码 shape 与变体(`gmm_w4a8_7168_1024_g256`、`bmm_t_tp8_th`)。
 - 同一算子常有 **L0(正确性档)** 与 **L1_par/tp8(性能档)** 两档。
 - **工作机上还有第二个 DSL 仓库**也要纳入(汇总工作由工作机 AI 做,见 3.6)。
@@ -175,7 +175,7 @@ also_in            跨仓库重复时的另一路径(溯源)
 
 1. **登记仓库**:把要纳入的仓库根路径列进 `repos.txt`(op_test + 新仓库)。
 2. **筛风格**:对每个仓库 `grep -rl '@sub_kernel' --include='*.py'`,再交叉 `grep -l 'compile_kernel'`。**只有同时命中的才算合格范本**。`import mindspore`/`ms_` 前缀、`@swft.jit`/`@jit` 一律排除。
-3. **写提取脚本** `build_template_index.py`,对每个合格文件机械抽取(正则抽顶部大写常量→shape_signature;抽 `@sub_kernel` 函数名/文件名分词→op_kind_tokens/variant_tags;grep API 名单→api_fingerprint;抽 `exec_kernel(...)`→io_signature;目录/par/tp8→tier 初值)。**不读正文进上下文,只做字符串提取。**
+3. **写提取脚本** `build_template_index.py`,对每个合格文件机械抽取(正则抽顶部大写常量→shape_signature;抽 `@sub_kernel` 函数名/文件名分词→op_kind_tokens/variant_tags;grep API 名单→api_fingerprint;抽 `exec_kernel(...)`→io_signature;grep `def gen_golden_data`→has_golden_gen;目录/par/tp8→tier 初值)。**不读正文进上下文,只做字符串提取。**
 4. **跑脚本 + 合并**:对所有仓库跑,汇成单个 `global_index.json`。
 5. **跨仓库去重/溯源**:同名同 shape 同 api 的保留一条,另一路径记入 `also_in`;`tier=perf` 优先级标高。
 6. **抽查**:随机打开 3–5 条,核对 op_kind/shape/api_fingerprint 与文件相符即可,不必逐个读。
@@ -271,6 +271,13 @@ L3  定向 grep 后端 codegen 源码(仅工作机)    罕见; 报错指向后�
         --成品--judge通过 + 人工确认--> 回流 global 库 ───────┘ (下个模型可复用)
 ```
 
+**worker "换golden加载" 这一步的两种范本形态(对应 2.2 的"见 5.3"):** 范本造参考数据有两种写法,worker 改写前必须先识别自己抄的范本属于哪种,再据此换接中间 golden:
+
+- **具名函数形态(约 20/44)**:范本里有 `def gen_golden_data(): ...` 显式造数并存盘。改写方式:把该函数体替换为"从 03 产出的算子级中间 golden 路径加载"(`np.load(<intermediate_golden_path>)`),其余对拍链路不动。
+- **inline numpy 形态(约 22/44)**:范本在 `main`/脚本顶层直接用 numpy 现造输入与期望输出,无独立函数。改写方式:定位这段 inline 造数代码块(通常在 `compile_kernel`/`exec_kernel` 调用之前),整体替换为从中间 golden 路径加载。
+
+两种形态的判定是机械的(grep `def gen_golden_data`),无需弱模型理解范本语义。检索器注入范本正文时,可在附注里标明 `has_golden_gen` 字段(见 3.2 schema),提前告诉 worker 该走哪种改写路径。
+
 ### 5.4 如何同时满足最初三诉求
 
 1. **"让复杂变简单"**:弱模型的活永远是"改一个算子范本到对拍",其能力范围内的最小活,不罢工。
@@ -287,4 +294,42 @@ L3  定向 grep 后端 codegen 源码(仅工作机)    罕见; 报错指向后�
 - **保留**:现有 worker/judge 双包隔离、阶段隔离、路线 B、family/子图分会话骨架。
 - **新增脚本**(建议命名,实现者可调整):`build_template_index.py`(构建器)、算子 worker driver(05/07 共用)、检索器模块。
 - **改造脚本**:`02_partition` 相关(加算子清单 + 融合决策)、`03_torch_golden` 相关(加算子级中间 golden)、`package_dsl_agents.py`(改为算子级瘦包)、`04_dsl_skeleton`(降级为冒烟检查)。
+
+
+---
+
+## 7. 多模型共用工程布局
+
+**诉求**:harness 当前用起来像"一次性"——跑一个计算图就占满工程目录。要改成**共用工程**:新模型来了不复制整个 harness,只在工程外新增一个独立 workspace,配置路径做适配即可。
+
+**好消息**:现有代码已具备全部机制,只是没用起来、没文档化。`init_pipeline.py` 已接受 `--workspace`(可为任意绝对路径,不强制在工程内);`harness_common.py` 的 `resolve_external`(约第 123-155 行)已有 `relative_to: "harness"` vs `"workspace"` 的双根路径解析。本节是把这个雏形**正式化**,不是新工程。
+
+### 7.1 核心原则
+
+> **工程目录 = 只读的共享层 + 代码;每模型的一切都在工程外的独立 workspace(如 `~/swft-runs/<model_name>/`)。**
+
+### 7.2 两类资产彻底分开
+
+| 类别 | 放哪 | `relative_to` | 内容 |
+|---|---|---|---|
+| **共享层(跨模型,只读)** | 工程目录内 | `harness` | 脚本、`configs/pipeline.default.json`、docs、`template_index/global_index.json`、`api_reference.json`、编译器源码引用 |
+| **每模型层(独立,可写)** | 工程外 `~/swft-runs/<model_name>/` | `workspace` | torch model/weights、各阶段产物、算子级 golden、算子 DSL、`pipeline_state.json`、`input_paths.json`、**run-local 索引** |
+
+### 7.3 跑新模型的操作(即"只新增一个目录")
+
+```
+python3 scripts/init_pipeline.py --workspace ~/swft-runs/<新模型名>
+# 编辑该 workspace 下 input_paths.json, 指向这个模型的 torch 源码/权重
+# 工程目录纹丝不动, 共享层被所有模型复用
+```
+
+### 7.4 要改的三点(让"共用"名副其实)
+
+1. **`init_pipeline.py` 默认 workspace**:从 `work`(单数、易被下个模型覆盖)改为**必填或引导填工程外 `~/swft-runs/<model_name>`**;README 改为多模型口吻。防止新模型覆盖旧模型。
+2. **共享索引的家**:`template_index/global_index.json` 与 `api_reference.json` 落在**工程目录内**(`relative_to: harness`),被所有 workspace 共享检索。与第 3 节"索引离线、跨模型"一致。
+3. **run-local 索引的家**:每模型的 run-local 索引落在**该 workspace 内**,与 global 物理隔离。检索器先查 workspace 的 run-local,再查工程内的 global(对应 3.3 检索顺序)。
+
+### 7.5 对 global 回流的影响(呼应 5.1)
+
+回流 = 把某 workspace 里 judge 通过的成品,**人工确认后写入工程目录的 global 索引**——这是一次跨越"私有 workspace → 共享层"边界的操作,所以 5.1 的"人工确认闸"本质上就是这道边界的守卫。
 
