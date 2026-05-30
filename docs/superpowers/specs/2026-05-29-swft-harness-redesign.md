@@ -72,7 +72,7 @@
 旧 harness 有个观察到的 bug:04 阶段专门趟平编译/IO 路径,但 05 实现 DSL 时还在 input 路径上犯同样的错——经验没传下去。
 
 三层架构让这个问题**消失**,而不是"修复":
-- 每个范本本身就是自带 **参考数据生成 + `@sub_kernel` + `compile_kernel`/`exec_kernel` + `verify_result` 对拍**的**完整可跑通小程序**。(注:参考数据生成有两种形式——约 20/44 范本是具名 `gen_golden_data()` 函数,其余约 22 个是 inline numpy 造数。worker 改写时两种都要能识别,见 5.3。)
+- 每个范本本身就是自带 **参考数据生成 + `@sub_kernel` + `compile_kernel`/`exec_kernel` + `verify_result` 对拍**的**完整可跑通小程序**。(注:参考数据生成是一个**具名函数**,但函数名有两种——约 20/42 范本叫 `gen_golden_data()`,其余约 22 个叫 `gen_data()`;无 inline 造数形态。两者都在 `main` 里被调用、把 numpy 数组 `.tofile()` 到 `./temp/<OP_NAME>/input|output/*.bin`。worker 改写时要识别"`main` 里调的是哪个数据生成函数",而非死认函数名,见 5.3。)
 - 算子 worker 抄范本时,IO/编译链路就是现成跑通的;它对拍不过会立刻在自己这一层发现,不会把错带到下游。
 - 所以"04 趟平的 IO 经验要传给 05"这个需求根本不存在了——它变成了"范本自带正确链路"的副作用。
 
@@ -113,9 +113,10 @@
 - 路径 `/home/kgx/code/kernel/reverse/akg/swft/op_test`,44 个算子范本。
 - **42 个是 `@sub_kernel` 风格(要的)**;只有 2 个 `ms_*` 是 MindSpore/jit(`math/ms_tanh.py`、`fusion/ms_reshape_and_cache.py`),**排除**。
 - SWFT 有 3 条路径(见 `swft/README.md`):`@sub_kernel`(要)、MindSpore 原生、Python `@swft.jit`。**只索引同时含 `@sub_kernel` 且含 `compile_kernel` 的范本。**
-- 每个范本是 ~100–330 行的**自包含完整程序**(单个约 3–4k token,per-operator 注入一整段在 400k 窗口里毫无压力),自带**参考数据生成**(具名 `gen_golden_data` 或 inline numpy,两种形态见 5.3) + `@sub_kernel` 实现 + `compile_kernel`/`exec_kernel` + 调 `verify_result.py` 对拍。
+- 每个范本是 ~100–330 行的**自包含完整程序**(单个约 3–4k token,per-operator 注入一整段在 400k 窗口里毫无压力),自带**参考数据生成**(具名函数 `gen_golden_data()` 或 `gen_data()`,二选一,见 5.3) + `@sub_kernel` 实现 + `compile_kernel`/`exec_kernel` + 调 `verify_result.py` 对拍。
 - 已分类:`bmm/gmm/matmul/pa/reduce/math/fusion`,文件名直接编码 shape 与变体(`gmm_w4a8_7168_1024_g256`、`bmm_t_tp8_th`)。
 - 同一算子常有 **L0(正确性档)** 与 **L1_par/tp8(性能档)** 两档。
+- **多数范本是"一个文件一个 `@sub_kernel`",但有少数融合范本一个文件含多个 `@sub_kernel`**(实测:`fusion/moe_init_routing.py`=7、`fusion/premla.py`=5、`fusion/full_sort.py`=4、`matmul_L0/matmul_294912_2.py`=2)。索引 schema 必须能表达"一个范本文件 → 多个 sub_kernel + 其 compile 调用序",见 3.2。
 - **工作机上还有第二个 DSL 仓库**也要纳入(汇总工作由工作机 AI 做,见 3.6)。
 
 ### 3.2 部件一:构建器 `build_template_index.py`(离线、幂等、可重跑)
@@ -138,12 +139,17 @@ variant_tags       tp8 / trans_b / biasadd / output_transpose / par ...
 tier               correctness(L0/无par) 或 perf(L1/par/tp8) — 见 3.5 多信号判定
 api_fingerprint    该范本用到的 SWFT API 列表(见 3.4, 名单从编译器源码自动枚举)
 io_signature       从 exec_kernel(... inputs=[...], outputs=[...]) 解析
-has_golden_gen     是否含 gen_golden_data()
+golden_gen_func    数据生成函数名, 取值 "gen_golden_data" 或 "gen_data"(见 5.3)
+subkernels         该文件内 @sub_kernel 函数名列表(多数为 1 个; 融合范本为多个)
+compile_sequence   compile_kernel/compile_func 的调用序(多 sub_kernel 时拼装组装顺序; 单 kernel 时长度为 1)
+is_fused           subkernels 长度 > 1 时为 true(标记"一个文件多算子"的融合范本)
 line_count         规模
 also_in            跨仓库重复时的另一路径(溯源)
 ```
 
 最关键检索维度:**op_kind_tokens + shape_signature + api_fingerprint + tier**。
+
+> **关于 `is_fused`/多 sub_kernel 范本(对应 2.1 与 4.4)**:这类范本是"一个文件里多个 `@sub_kernel` 协作完成一个融合算子",`compile_sequence` 记录其组装顺序。检索器把它当**一个融合单元**整体注入(它对应的是 02 的【融合决策】产出的"融合后算子",不是叶子算子)。叶子算子 worker 默认检索 `is_fused=false` 的单 kernel 范本。
 
 ### 3.3 部件二:检索器(运行时,per-operator,05 与 07 共用)
 
@@ -156,8 +162,8 @@ also_in            跨仓库重复时的另一路径(溯源)
 
 编译器前端源码 `/home/kgx/code/kernel/reverse/akg/swft/python/swft`(约 6460 行)是 DSL **全部对外 API 的权威定义**。由 `build_template_index.py` **同期生成**一份 `api_reference.json`:
 
-- 扫 `python/swft/api/*.py` + `core/*.py`,机械抽出每个导出函数名、签名、所在模块。
-- 用途 ①:`api_fingerprint` 的 API 名单**从源码自动枚举**(不再硬编码,不漏不错,随编译器升级自动更新)。
+- **以 `__init__.py` 的导出表为准枚举公开 API,而非扫所有 `*.py`。** 公开入口由 `python/swft/api/__init__.py` 与 `python/swft/core/__init__.py` 的 `from .xxx import ...` 语句 re-export(实测:`api/__init__.py` re-export 了 compute/move/transdata/slicedata/sort 等模块的函数,且 `exec_kernel` 来自 `swft.runtime`、也在此处 re-export)。**步骤**:① 解析这些 `__init__.py` 的 import 语句得到"公开 API 名单 + 其定义所在模块";② 再到定义模块里反查每个名字的 `def` 签名。这样既不会把内部 helper 当成可用 API,也不会漏掉 `exec_kernel` 这类跨包 re-export 的运行时 API。
+- 用途 ①:`api_fingerprint` 的 API 名单**从上述导出表自动枚举**(不再硬编码,不漏不错,随编译器升级自动更新)。
 - 用途 ②:检索器给 worker 注入范本时,附带该范本所用 API 的**权威签名切片**(精准、极小),根治"幻觉 API / 用错签名"。
 - 用途 ③:worker 自检——写出的每个 API 调用可对真值源核验"存在且签名对",而非编译失败才发现。
 
@@ -175,7 +181,7 @@ also_in            跨仓库重复时的另一路径(溯源)
 
 1. **登记仓库**:把要纳入的仓库根路径列进 `repos.txt`(op_test + 新仓库)。
 2. **筛风格**:对每个仓库 `grep -rl '@sub_kernel' --include='*.py'`,再交叉 `grep -l 'compile_kernel'`。**只有同时命中的才算合格范本**。`import mindspore`/`ms_` 前缀、`@swft.jit`/`@jit` 一律排除。
-3. **写提取脚本** `build_template_index.py`,对每个合格文件机械抽取(正则抽顶部大写常量→shape_signature;抽 `@sub_kernel` 函数名/文件名分词→op_kind_tokens/variant_tags;grep API 名单→api_fingerprint;抽 `exec_kernel(...)`→io_signature;grep `def gen_golden_data`→has_golden_gen;目录/par/tp8→tier 初值)。**不读正文进上下文,只做字符串提取。**
+3. **写提取脚本** `build_template_index.py`,对每个合格文件机械抽取(正则抽顶部大写常量→shape_signature;抽**所有** `@sub_kernel` 函数名→subkernels(可能多个),分词→op_kind_tokens/variant_tags;抽 `compile_kernel`/`compile_func` 调用序→compile_sequence;grep API 名单→api_fingerprint;抽 `exec_kernel(...)`→io_signature;grep `def gen_golden_data`/`def gen_data` 并看 `main` 调用哪个→golden_gen_func;subkernels 数>1→is_fused;目录/par/tp8→tier 初值)。**不读正文进上下文,只做字符串提取。**
 4. **跑脚本 + 合并**:对所有仓库跑,汇成单个 `global_index.json`。
 5. **跨仓库去重/溯源**:同名同 shape 同 api 的保留一条,另一路径记入 `also_in`;`tier=perf` 优先级标高。
 6. **抽查**:随机打开 3–5 条,核对 op_kind/shape/api_fingerprint 与文件相符即可,不必逐个读。
@@ -191,7 +197,7 @@ also_in            跨仓库重复时的另一路径(溯源)
 
 ### 4.1 性能反馈信号(07 能否闭环的命门)
 
-- swft `exec_kernel` 接受 `profiling` 参数(如 1000):执行 N 次返回平均时延,粒度是**整个 DSL exec**。
+- swft `exec_kernel` 接受 `profiling` 参数(如 1000):令其执行 N 次并测平均时延,粒度是**整个 DSL exec**。**注意机制(实测)**:`exec_kernel` 不返回时延数值;`profiling>0` 时它在生成的 C++ host 程序里插入计时打印,运行后向 **stdout** 打出形如 `program avg duration <X> us` 的行(见 `swft/python/swft/runtime/kernel_session.py` 的 `profiling` 分支与 `utils/codegen_utils.py:gen_profiling`)。因此 **driver 必须捕获并正则解析 worker 进程的 stdout** 取出这个 `us` 数值,写进机器可读的算子性能 report(而非期望函数返回值)。
 - **在三层架构下这恰好够用**:每个算子 worker 编译执行的"整个 DSL"就是它负责的**那一个算子**,所以"整 exec 平均时延"= 该算子时延。**算子级性能反馈无需 msprof 即可获得。**
 - `msprof` 仅在需要单 kernel 内部搬运/计算细分时才用——那是 Phase 2 极致调优的事。
 
@@ -271,12 +277,14 @@ L3  定向 grep 后端 codegen 源码(仅工作机)    罕见; 报错指向后�
         --成品--judge通过 + 人工确认--> 回流 global 库 ───────┘ (下个模型可复用)
 ```
 
-**worker "换golden加载" 这一步的两种范本形态(对应 2.2 的"见 5.3"):** 范本造参考数据有两种写法,worker 改写前必须先识别自己抄的范本属于哪种,再据此换接中间 golden:
+**worker "换 golden 加载" 这一步该怎么改(对应 2.2 的"见 5.3"):** 范本的参考数据一律由一个**具名函数**生成(无 inline 形态),函数名有两种——约 20 个叫 `gen_golden_data()`、约 22 个叫 `gen_data()`——该函数在 `main` 里被调用,内部用 numpy 造出输入与期望输出,再 `.tofile()` 落到 `./temp/<OP_NAME>/input/*.bin` 与 `./temp/<OP_NAME>/output/<...>_golden.bin`。`exec_kernel`/`verify_result` 之后从这些 `.bin` 路径读回比对。
 
-- **具名函数形态(约 20/44)**:范本里有 `def gen_golden_data(): ...` 显式造数并存盘。改写方式:把该函数体替换为"从 03 产出的算子级中间 golden 路径加载"(`np.load(<intermediate_golden_path>)`),其余对拍链路不动。
-- **inline numpy 形态(约 22/44)**:范本在 `main`/脚本顶层直接用 numpy 现造输入与期望输出,无独立函数。改写方式:定位这段 inline 造数代码块(通常在 `compile_kernel`/`exec_kernel` 调用之前),整体替换为从中间 golden 路径加载。
+因此 worker 的改写不是"替换函数名",而是**换数据来源**,机械步骤如下:
+1. 在 `main` 里定位数据生成函数的调用(`gen_golden_data()` 或 `gen_data()`,以 `main` 实际调用的为准,**不要死认函数名**)。
+2. 读该函数体里的 `.tofile("./temp/<OP_NAME>/input|output/<name>.bin")` 列表,得到"逻辑张量名 → bin 路径"的映射。
+3. 把"现造 numpy + tofile"替换为"从 03 产出的算子级中间 golden 拷贝/软链到同一组 `.bin` 路径"(输入张量与 golden 输出都来自中间 golden)。其余 `compile_kernel`/`exec_kernel`/`verify_result` 链路不动。
 
-两种形态的判定是机械的(grep `def gen_golden_data`),无需弱模型理解范本语义。检索器注入范本正文时,可在附注里标明 `has_golden_gen` 字段(见 3.2 schema),提前告诉 worker 该走哪种改写路径。
+判定走哪种函数名是机械的(grep `def gen_golden_data` / `def gen_data`),无需弱模型理解范本语义。索引在 3.2 用 `golden_gen_func` 字段记录该范本的数据生成函数名(取值 `gen_golden_data`/`gen_data`),检索器注入范本正文时一并附上,提前告诉 worker 去 `main` 里找哪个调用。
 
 ### 5.4 如何同时满足最初三诉求
 
@@ -294,6 +302,21 @@ L3  定向 grep 后端 codegen 源码(仅工作机)    罕见; 报错指向后�
 - **保留**:现有 worker/judge 双包隔离、阶段隔离、路线 B、family/子图分会话骨架。
 - **新增脚本**(建议命名,实现者可调整):`build_template_index.py`(构建器)、算子 worker driver(05/07 共用)、检索器模块。
 - **改造脚本**:`02_partition` 相关(加算子清单 + 融合决策)、`03_torch_golden` 相关(加算子级中间 golden)、`package_dsl_agents.py`(改为算子级瘦包)、`04_dsl_skeleton`(降级为冒烟检查)。
+
+### 6.1 本 spec 是架构设计,不是实现 plan(留给 plan 钉死的契约)
+
+本文档定下"为什么这么改、整体结构、各部件职责与边界"。以下**可执行契约**有意留到实现 plan 阶段逐一钉死(弱模型实现者最易在此乱猜,plan 必须给出 file-level 的精确定义,不可省):
+
+1. **`operator_manifest.json` schema(02 产出,driver 消费)**:`op_id`、父 partition、对应 IR node 范围、拓扑序、输入/输出 tensor 名与 shape/dtype/layout(ND/NZ)、`.bin` 路径、权重绑定、`fusable` 边界标记、目标 tier。当前 `configs/pipeline.default.json` 的 02 仅产 `partition_plan.json`,需新增此契约与对应 `required_outputs`/`input_refs`。
+2. **`operator_golden_manifest.json` schema(03 产出)**:每个 `op_id` → 其算子级中间 golden 的 `.bin` 路径 + hash + 来自哪个 torch hook 点。当前 03 仅产 `golden_manifest.json`。
+3. **operator implementation ABI(worker 写回 / driver 组装的对接面)**:写回函数签名、Tensor 命名约定、临时 GM buffer 约定、ND/NZ layout、多 sub_kernel 时的 `compile_func` 组织、输出文件目录结构。无此 ABI,单算子对拍过了仍可能拼不进整层。
+4. **05/07 driver 契约**:driver CLI、`claude -p` 调用与 prompt 文件、注入内容(IR 切片+范本+API 切片+golden 路径)、超时/重试、stdout/stderr 落盘、worker 成败判定(尤其 4.1 的 profiling stdout 解析)、"需人工"升级状态、是否允许并发。当前 harness 是**文件打包器、不自动拉起 agent**(见 README),driver 是**新增的执行层**。
+5. **run-local 索引 schema + 并发/污染控制**:多个子图窗口可能并行写 run-local 索引,需**原子写 + 文件锁**;记录 `status`(passed/judged/promoted)、复用次数、来源 `op_id`、golden hash、template hash。schema 可复用 3.2 global schema 的子集。
+
+### 6.2 与现有代码的两处硬约束(plan 必须处理,否则会撞车)
+
+- **04 降级会撞当前线性状态机**:`scripts/package_stage.py` 强制"前一阶段 `passed` 才能打包下一阶段"。把 04 从"每模型必经"降为"一次性冒烟"需要二选一:① 给状态机加 `skipped`/`cached_passed` 合法态;或 ② 把冒烟检查从 pipeline stage 移出,做成 **harness 级一次性 shared check**(更干净,推荐)。
+- **机械验证门当前过弱**:`scripts/validate_stage.py` 基本只查 `required_outputs` 存在 + 跑配置的 `validation_commands`(现多为空)。新架构强依赖"模板索引 / operator golden / 单算子 compile+run+对拍",**必须给 02/03/05/07 配 schema validator + 真实验证命令**,否则弱模型可能"只造出文件就过门"(正是 harness 要防的失败模式)。
 
 
 ---
