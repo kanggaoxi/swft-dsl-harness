@@ -157,6 +157,33 @@ also_in            跨仓库重复时的另一路径(溯源)
 - 输出:1–2 条最相似范本的 `template_id` + `abs_path`。
 - 注入给 worker 的不是整库,而是**那 1–2 段范本正文** + **该范本用到的 API 的权威签名切片**(从 api_fingerprint 反查 API 真值源,见 3.4)。
 - 检索域顺序:**run-local 索引优先**(本次已验证的),再 global 索引。理由见第 5 节复用。
+- **每条检索结果带一个 `match_confidence`**(由命中维度数算出,见下),worker 与 driver 据此决定信任程度与兜底动作。
+
+#### 3.3.1 相似度与命中分级(回答"怎么算最相似")
+
+检索是**确定性打分**,不靠弱模型判断。按维度优先级逐层匹配,每层命中加权累加成 `match_confidence` ∈ {exact / strong / weak / none}:
+
+1. `op_kind_tokens` 必须**语义同类**(matmul↔matmul,不跨到 reduce)——不满足直接判 `none`,进 3.3.2 兜底。
+2. `shape_signature` 精确相等 → exact 候选;仅维度数/布局相同但数值不同 → strong;同 op 但 shape 差很多 → weak。
+3. `dtype_tags` + `variant_tags`(trans_b/biasadd/tp8…)命中越多越靠前。
+4. `tier` 与目标档一致(05 要 correctness,07 要 perf)。tier 不匹配**不淘汰**,转 3.3.3 处理。
+
+输出排序后的前 1–2 条。`exact`/`strong` 直接注入 worker;`weak` 注入时**显式告诉 worker"这是近似范本,shape/变体需较多改写"**;`none` 不注入假范本,走兜底。
+
+#### 3.3.2 没有好范本可抄怎么办(回答 Q2 上半)
+
+按"放宽阶梯"逐级退让,每一级都把当前置信度记进 worker 任务包,**绝不假装有 exact 范本**:
+
+1. **放宽 shape**:同 op_kind、同 variant,接受任意 shape 的范本(shape 是 worker 最会改的维度,改 shape 风险低)。
+2. **放宽 variant**:同 op_kind,丢掉 biasadd/trans_b 等变体要求,worker 再手动补/删该变体(此时附上 3.4 的相关 API 签名切片)。
+3. **跨档借用**:correctness 缺档时借 perf 范本"降级抄"(把流水/tiling 部分删成最小正确实现);perf 缺档时借 correctness 范本作 07 的 baseline 起点(见 3.3.3)。
+4. **结构最近邻**:仍无,则取 `op_category` 内行数/api_fingerprint 最接近的一条作"骨架参考",worker 任务标记为 **`low_confidence`**。
+5. **升级人工**:连骨架都没有(全新算子语义),**不让弱模型从零合成**——标记该算子 `needs_human`,产出"缺范本"报告(算子签名 + 已检索过的最近候选),交人或强模型补一条种子范本进库。这是 1.2 成功公式第 1 条("永远有范本可抄")的兜底闸:**宁可挂起,不可让弱模型空手创作**。
+
+#### 3.3.3 tier 缺档:只有 perf 档 / 只有 correctness 档(回答 Q1 下半)
+
+- **某算子只有 perf 档范本(无 correctness)**:05 仍用它,但 worker 任务附指令"**先降级成最小正确实现**"——删掉 double-buffer/手动 tiling/流水同步等纯优化结构(这些 API 在 3.5 已标),只保留算子语义 + IO + 对拍。降级后的版本进 run-local correctness 层;原 perf 范本留给 07 直接复用。
+- **某算子只有 correctness 档范本(无 perf)**:05 正常用。到 07 时**没有 perf 范本可检索** → 该算子进 07 的"**仅靠 move catalog 套用**"路径(4.3):以 05 的正确版本为 baseline,只套通用 move(double_buffer/tiling),不期待有现成 perf 范本照抄。若套完仍不达标,标 `needs_human`(归入 07B,见 4.6)。
 
 ### 3.4 API 真值源 `api_reference.json`(编译器源码的用法之一)
 
@@ -169,11 +196,15 @@ also_in            跨仓库重复时的另一路径(溯源)
 
 ### 3.5 tier 多信号判定(不靠目录名)
 
+**为什么需要 tier**:05 要的是"最小正确实现"(好抄、好对拍),07 要的是"带优化结构的实现"(有 move 可学)。所以构建期给每个范本打 `tier ∈ {correctness, perf}`,检索器据目标档过滤(05 取 correctness、07 取 perf,见 3.3)。**不能只看目录名**——同一目录混档、命名不规范都会误判。
+
 `tier` 由**多信号投票**,目录名只是其一:
-1. **性能 API 出现与否**:api_fingerprint 里有无 double-buffer/ping-pong、手动 `set_flag`/`wait_flag` 流水同步、多级 tiling 循环、preload 等(纯正确性实现没有)。
+1. **性能 API 出现与否**(最强信号):api_fingerprint 里有无 double-buffer/ping-pong、手动 `set_flag`/`wait_flag` 流水同步、多级 tiling 循环、preload 等(纯正确性实现没有)。**这同时也是 4.3 move catalog 归一化 move 的依据**——perf 范本相对 correctness 范本多出来的正是这些结构。
 2. **结构复杂度**:循环嵌套深度、buffer 数量、行数。
-3. **目录/文件名提示**:`par`/`tp8`/`L1`/`L0`(仅其一)。
+3. **目录/文件名提示**:`par`/`tp8`/`L1`/`L0`(仅其一,**不单独定档**)。
 4. **弱模型聚焦判断**:构建期对每个范本问一个是非题——"是否含超出最小正确实现的显式优化(流水/tiling/融合)?"(聚焦判断,非合成,弱模型可做)。
+
+判定规则:信号 1 命中即倾向 perf;1 不命中且 2/3 弱 → correctness;冲突时以信号 1 为准。**一个算子可同时有两档范本**(各自一条索引);**只有一档时的处理见 3.3.3**。
 
 ### 3.6 给工作机 AI 的范本汇总指导(自包含,可直接交付)
 
@@ -195,36 +226,75 @@ also_in            跨仓库重复时的另一路径(溯源)
 
 **明确警示给实现者**:极致调优是连强模型都吃力的专家级任务,"让它查个范本"远远不够。哪些算子能融合、怎么排流水掩盖搬运、tiling 怎么不爆内存——本质是**带约束的搜索决策**,不是"抄一段代码"。本节按弱模型可行的方式分期设计,**不赌极致调优全自动**。
 
+> **参考与现实标尺**:arXiv:2603.24517(AVO, Agentic Variation Operators)在 B200 上让 coding agent 充当进化搜索的 variation operator,以 correctness-gated 打分 + 仅在不退步时提交 + lineage 作上下文,自动调出超过 cuDNN/FA4 的 attention kernel。**但它用的是强模型、连跑 7 天、内部探索 500+ 方向、提交 40 版**,且收益来自寄存器溢出/warp 同步这类微架构推理。结论很硬:这种**全自动极致调优属于我们的 07B(需强模型/人)**;弱模型能稳定做的是下面的 **07A**(套已知 move 的有界爬山)。我们借用 AVO 的三个机制(correctness-gated、只提交不退步版本、lineage 作上下文),但**不照搬其"让 agent 自由探索"**——那对弱模型就是罢工诱因。
+
 ### 4.1 性能反馈信号(07 能否闭环的命门)
 
 - swft `exec_kernel` 接受 `profiling` 参数(如 1000):令其执行 N 次并测平均时延,粒度是**整个 DSL exec**。**注意机制(实测)**:`exec_kernel` 不返回时延数值;`profiling>0` 时它在生成的 C++ host 程序里插入计时打印,运行后向 **stdout** 打出形如 `program avg duration <X> us` 的行(见 `swft/python/swft/runtime/kernel_session.py` 的 `profiling` 分支与 `utils/codegen_utils.py:gen_profiling`)。因此 **driver 必须捕获并正则解析 worker 进程的 stdout** 取出这个 `us` 数值,写进机器可读的算子性能 report(而非期望函数返回值)。
 - **在三层架构下这恰好够用**:每个算子 worker 编译执行的"整个 DSL"就是它负责的**那一个算子**,所以"整 exec 平均时延"= 该算子时延。**算子级性能反馈无需 msprof 即可获得。**
 - `msprof` 仅在需要单 kernel 内部搬运/计算细分时才用——那是 Phase 2 极致调优的事。
 
-### 4.2 07 的爬山环(算子级)
+### 4.2 07A:弱模型可机械执行的调优协议
 
-1. 算子已正确(05 产出,run-local 已验证)。
-2. 检索 **perf/L1_par/tp8 档**最相似范本。
-3. **套一条优化 move** → 重编译 → 跑 profiling 拿平均时延 → **更快且仍对拍** 则保留,否则回退。
-4. 一次只套一个 move,小步前进(回到"短反馈 + 局部改动"的成功公式)。
+把 07 拆成两档(借鉴 arXiv:2603.24517 "AVO":让 agent 当 evolutionary 的 variation operator,以 correctness-gated 打分 + 仅在不退步时提交 + lineage 作上下文——但 AVO 用的是**强模型 7 天 500 次探索**,故其全自动只能对应我们的 07B)。**07A 是弱模型确定性能跑的那部分**,完整协议如下:
 
-### 4.3 优化动作目录(move catalog)
+**步骤 0|选优化对象(回答"先调哪个")**:05 是纯正确性阶段、**不带 profiling**(其 `exec_kernel` 不开 profiling),所以**baseline 时延由 07 driver 的一次"基线测量预跑"产生**,不是 05 的产物:07 启动时,driver 对每个 05 已通过的算子用 `profiling>0` 重跑一次(代码不改,只开 profiling),解析 stdout 得 `baseline_latency_us` 写进该算子的 `perf_attempts.json`。然后按时延降序排,**只对 top-k 热点算子起 07A worker**(冷算子不值得调,省窗口)。每个算子带一个可选 `latency_budget_us`(02/规划层给的预算),达标即停。
 
-把已知优化手法做成**具名、可机械套用的代码变换配方**,每条配一对 before/after 范本片段:
-- `double_buffer` / `ping_pong`:搬运与计算重叠。
-- `tile_along_K` / `tile_along_M`:tiling 模板(防内存爆)。
-- `fuse_matmul_bias` 等:融合前后对照。
+**步骤 1|建 baseline lineage**:把步骤 0 测得的 05 正确版本作为 lineage 第 0 版,其 `latency_us = baseline_latency_us`。
 
-弱模型**套用已知 move,不发明策略**。move catalog 是范本索引子系统的一类特殊条目(tier=perf,带 before/after)。
+**步骤 2|取候选 move**:① 先检索 perf 范本(3.3,目标 tier=perf);命中则把它与当前版本的差异**尝试归一成 move catalog 里的具名 move**——若差异能干净映射到 ≤1 个 catalog move,取该 move;**若 diff 复杂、映射不到单个 catalog move,不让 worker 自由分析**,直接回退到 ② 或按 4.6② 升级("需要的 move 不在 catalog")。② 无 perf 范本(或①回退)则从 4.3 move catalog 取**该 op_category 适用**的 move。
+
+**步骤 3|套一个 move → 重编译 → profiling → 对拍**(单步,小步前进):
+- 一次**只套一个 move**(4.4 的成功公式:短反馈 + 局部改动)。
+- **判定"更快"的硬规则**(回答 Codex):测量时先做一次 warmup 调用(`exec_kernel` 跑一遍、丢弃,排除首次编译/加载抖动),再用固定 `repeat`(如 1000)的 `profiling>0` 调用取 stdout 的 `avg duration us`;**新时延 < 当前最优 × (1 − ε)**(ε 显著性阈,如 3%,压过噪声)才算"更快";**且必须仍对拍通过**(correctness-gated:对拍不过则该 move 直接判失败,等同 AVO 的 score=0)。
+- **提交规则**(借 AVO):满足"更快 ∧ 对拍过"才提交为 lineage 新版;否则**回退**到上一版,该 move 记入 `rejected_moves`。
+
+**步骤 4|搜索策略与停止条件**(回答 Codex):
+- greedy + 有界:维护"待试 move 列表",每次贪心试一个;`max_moves_per_op`(如 8)为尝试上限。
+- 停止条件(任一):达 `latency_budget_us` / 待试 move 列表空 / 连续 `P` 个 move 都未带来 ≥ε 提升(收益递减)。
+- 全程把每次尝试写进 `perf_attempts.json`(见 4.5 产物契约),失败的也记,供回溯与 07B。
+
+弱模型在 07A 里**只做"套已知 move + 跑 + 比 + 留/退"**,不发明策略、不跨算子重排——它面对的永远是"对这一个算子套这一个具名 move"的最小活。
+
+### 4.3 优化动作目录(move catalog,可机械套用)
+
+把已知优化手法做成**具名、可机械套用的变换配方**。每条 move 是范本索引子系统的一类特殊条目(tier=perf),**契约字段**(回答 Codex"move 只有名字"):
+
+```
+move_id            如 double_buffer / tile_along_K / fuse_matmul_bias
+applies_when       适用条件(op_category + 结构前提, 如"K 维 > 阈值才 tile_along_K")
+before_snippet     变换前代码片段(范本里的最小上下文)
+after_snippet      变换后代码片段
+memory_constraint  内存约束提示(如 tiling 后单 buffer 不得超 L1 容量)
+failure_symptoms   套错时的典型症状(编译报错串 / 对拍偏差 / 时延反增)
+revert_rule        如何干净回退到 before(保证可回滚)
+```
+
+Phase 1 只放**安全 move**:`double_buffer`/`ping_pong`(搬运计算重叠)、`tile_along_K`/`tile_along_M`(防内存爆)、`fuse_matmul_bias`(简单融合前后对照)。弱模型**套用,不发明**;`applies_when` 不满足就跳过该 move。
 
 ### 4.4 融合是子图/规划级决策,不属于叶子 worker
 
 "哪些算子能融合"需要看多个算子的边界,**必须在子图/规划层决定**(02 或一个规划会话),决定后把"融合后的算子"作为一个**新单元**交给 worker 去实现/调优。这是对 2.1 的重要修正:05 的"算子级 retrieve+adapt"对融合不直接适用,融合决策上移一层。
 
-### 4.5 分期
+**`fusion_plan` 契约**(回答 Codex"融合策略空缺"):02/规划层产出 `fusion_plan.json`,每条记:参与融合的 `op_id` 列表、融合后新单元的 `op_id`、可融合判据(相邻 + 数据依赖直连 + 无外部消费中间结果 + 在 move catalog 里有对应融合范本/move)、不可融合标记原因。**判据是规划层填的**,叶子 worker 只接收"已决定融合的新单元"当普通算子处理。复杂的跨算子融合若无现成范本/move → 归 07B。
 
-- **Phase 1**:正确 + 几个安全 move(double-buffer、基础 tiling)。试点目标到此。
-- **Phase 2**:复杂融合、精细流水的极致调优。大概率需要人或更强模型介入,不在弱模型全自动范围内。
+### 4.5 07 的产物契约(机器可读,driver 写)
+
+每个算子产 `perf_attempts.json`:`op_id`、`baseline_latency_us`、lineage(每个提交版本的 `latency_us` + 套的 move)、每次尝试(`move_id` + `candidate_latency_us` + `correctness_after_move` + 留/退)、`rejected_moves`、`best_latency_us`、停止原因、是否 `needs_human`。这是 07 能被审计、能续跑、能喂 07B 的基础。
+
+### 4.6 07B:辅助专家调优(不承诺弱模型全自动)
+
+以下**超出弱模型可靠执行范围**,07A 触不到目标时归到这里,由人或更强模型决策,弱模型/driver 只负责**备好证据**:
+- 跨算子 layout 协同、流水重排、寄存器/buffer 预算精细分配(正是 AVO 论文里靠强模型 7 天才啃下的那类——register-spill、warp 同步)。
+- 复杂融合(move catalog 里没有对应配方的)。
+- 需 `msprof` 做单 kernel 内部搬运/计算细分的瓶颈归因(4.1)。
+
+**弱模型→07B 的硬升级线(回答 Codex"边界要更硬")**:满足任一即停手、标 `needs_human`、产出 4.5 的 `perf_attempts.json` + 4.1 的 profiling 证据:① 07A 停止条件命中但未达 `latency_budget_us`;② 需要的 move 不在 catalog;③ 瓶颈归因需要 msprof;④ 涉及跨算子改动。**绝不让弱模型在专家级搜索里空转**。
+
+### 4.7 分期
+
+- **Phase 1(试点目标)**:05 正确 + 07A(安全 move 的算子级爬山)。到此为止即视为试点成功。
+- **Phase 2**:07B 的极致调优(复杂融合/精细流水/寄存器调度)。大概率需要人或更强模型,**不在弱模型全自动范围内**,本 spec 只定义其升级接口与证据契约,不承诺自动化。
 
 ---
 
@@ -236,9 +306,21 @@ also_in            跨仓库重复时的另一路径(溯源)
 - **global 层(人工确认闸)**:本次模型做完、07 调优过的成品回流进跨模型全局库时,**必须 judge 通过 + 人工确认**。理由:全局库是种子质量,污染会殃及未来所有模型。回流时补全与 op_test 范本同格式的元数据(tier/shape/api_fingerprint)。
 - **自增强信号**:run-local 中"被复用多次且始终对拍通过"的算子,是 global 回流的最佳候选(复用次数 = 质量信号,作人工确认时的排序依据)。
 
-### 5.2 分层故障检索 escalation(编译器源码各安其位)
+### 5.2 算子 worker 失败时怎么办(05 对拍不通过的协议)
 
-算子 worker 对拍/编译失败时,走**分层定向检索**,每层都是 grep 具体报错相关的那几行,绝非通读:
+worker 跑完会落在三种结局之一,**driver 据机器可读结果分流**,不靠弱模型自述:
+
+| 结局 | 判据 | worker 动作 |
+|---|---|---|
+| **A. 编译失败** | `compile_kernel` 报错 | 走 5.2.1 分层定向检索(L1→L2→L3),针对报错那几行查真值源 |
+| **B. 运行成功但对拍不过** | 跑完了,`verify_result` 的 rtol/误差超阈 | 走 5.2.2 对拍 mismatch 协议 |
+| **C. 对拍通过** | 误差在阈内 | 写回算子函数 + 进 run-local 索引 |
+
+每个算子有**有界尝试预算**(建议 `max_attempts=N`,如 6;driver 配置):每轮 = 一次"改写→编译→执行→对拍"。预算耗尽仍未通过 → 标 `needs_human`,产出诊断报告(见末尾),**绝不让弱模型无限打转**(这是 1.2 成功公式第 5 条"错误能局部定位"的执行闸)。
+
+#### 5.2.1 分层故障检索 escalation(结局 A:编译失败,编译器源码各安其位)
+
+算子 worker **编译**失败时,走**分层定向检索**,每层都是 grep 具体报错相关的那几行,绝非通读:
 
 ```
 L1  查 API 真值源 api_reference.json         默认; 查"这个 API 签名/约束"
@@ -251,6 +333,20 @@ L3  定向 grep 后端 codegen 源码(仅工作机)    罕见; 报错指向后�
 ```
 
 **边界(已确认)**:后端 codegen 源码是"故障字典"的最后一层逃生通道(L3),**不是**弱模型的常规依赖;架构绝不要求弱模型为"会写 DSL"去预先理解后端 codegen 原理。弱模型默认只在 L1/L2 活动。
+
+#### 5.2.2 对拍 mismatch 协议(结局 B:编译跑通但数值不对)
+
+这是弱模型最容易乱猜的一类失败,给它**固定排查顺序**(从最常见、最机械的原因查起,每步都是局部改动 + 立即重对拍):
+
+1. **golden 加载错位**(最高频):核对自己换接的中间 golden —— 输入张量 `.bin` 与 golden 输出 `.bin` 是否对应到正确的逻辑张量名(见 5.3 的"换 golden 加载"映射)、shape/dtype 解析是否与范本一致、是否字节序/转置(ND vs NZ)读错。
+2. **shape/排布改写残留**:抄来的范本 shape 常量是否全部换成了本算子的(漏改一个常量会"跑通但算错");`output_transpose`/`trans_b` 等变体是否与本算子一致。
+3. **dtype/量化参数**:w4a8/int8 这类范本的 scale/zero-point 是否随新 shape 改对;累加 dtype(FP32 累加再转 FP16)是否保留。
+4. **算子语义差一点**:本算子相对范本是否多/少一步(如带不带 bias、激活函数不同)——此时去 3.4 取相关 API 签名,按语义补这一步(这是"最小改写"允许的范围,仍不算从零创作)。
+5. **以上都排除仍不过** → 标 `needs_human`,**不猜**。
+
+> 注意:对拍 mismatch **不要**一上来就去翻后端 codegen 源码(L3)——数值不对绝大多数是上面 1–4 的改写疏漏,而非编译器 bug。L3 只在结局 A 且报错明确指向后端时才碰。
+
+**`needs_human` 诊断报告(每次升级人工都产出,机器可读)**:`op_id`、最终结局(A/B/C)、`attempts` 次数、每次尝试的"改了什么 + 编译/对拍结果 + 误差值"、检索到的范本及 `match_confidence`、最接近通过的一版路径。让人或强模型**接手时零冷启动**,也作 07B 的输入。
 
 ### 5.3 整体数据流
 
@@ -265,15 +361,17 @@ L3  定向 grep 后端 codegen 源码(仅工作机)    罕见; 报错指向后�
         --05正确性: 每个子图--                                 ▼
             人工开子图窗口 → driver 读算子清单 →
               对每个算子: claude -p 起 worker
-                (IR切片 + 检索L0范本 + API签名切片 + 中间golden)
+                (IR切片 + 检索correctness范本 + API签名切片 + 中间golden)
                 worker: 抄范本→换shape/dtype→换golden加载→对拍
                        失败→L1/L2/L3 定向检索→修复 or 升级人工
                 通过 → 写回算子函数 + 进 run-local 索引 ◄──┐
               driver 收齐 → 组装会话拼整层 → 整层对拍        │ 运行内复用
         --06集成--> 整图拓扑拼接 + 整图对拍                   │ (重复层直接命中)
-        --07调优: 每个算子--                                  │
-            driver → worker 检索 L1/perf 范本 → 爬山环        │
-              (套move→重编译→profiling→更快且对拍则留)       │
+        --07调优: top-k 热点算子--                            │
+            driver → worker 检索 perf 范本/move → 07A 爬山环   │
+              (套1个move→重编译→profiling解析stdout→           │
+               更快≥ε且对拍则提交,否则回退;有界尝试)         │
+              触不到目标 → 标 needs_human, 归 07B(人/强模型)   │
         --成品--judge通过 + 人工确认--> 回流 global 库 ───────┘ (下个模型可复用)
 ```
 
@@ -312,6 +410,7 @@ L3  定向 grep 后端 codegen 源码(仅工作机)    罕见; 报错指向后�
 3. **operator implementation ABI(worker 写回 / driver 组装的对接面)**:写回函数签名、Tensor 命名约定、临时 GM buffer 约定、ND/NZ layout、多 sub_kernel 时的 `compile_func` 组织、输出文件目录结构。无此 ABI,单算子对拍过了仍可能拼不进整层。
 4. **05/07 driver 契约**:driver CLI、`claude -p` 调用与 prompt 文件、注入内容(IR 切片+范本+API 切片+golden 路径)、超时/重试、stdout/stderr 落盘、worker 成败判定(尤其 4.1 的 profiling stdout 解析)、"需人工"升级状态、是否允许并发。当前 harness 是**文件打包器、不自动拉起 agent**(见 README),driver 是**新增的执行层**。
 5. **run-local 索引 schema + 并发/污染控制**:多个子图窗口可能并行写 run-local 索引,需**原子写 + 文件锁**;记录 `status`(passed/judged/promoted)、复用次数、来源 `op_id`、golden hash、template hash。schema 可复用 3.2 global schema 的子集。
+6. **07 调优契约**:`move catalog` 条目 schema(见 4.3 字段)、`fusion_plan.json` schema(见 4.4)、`perf_attempts.json` schema(见 4.5)、profiling stdout 的正则与 warmup/repeat/ε 参数(见 4.1/4.2)。这些是 07A 能机械执行的前提。
 
 ### 6.2 与现有代码的两处硬约束(plan 必须处理,否则会撞车)
 
